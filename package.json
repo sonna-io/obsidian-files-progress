@@ -1,0 +1,19 @@
+{
+	"name": "files-progress",
+	"version": "1.0.0",
+	"description": "Obsidian plugin: tiny fullness progress bars in the file explorer.",
+	"main": "main.js",
+	"scripts": {
+		"dev": "node esbuild.config.mjs",
+		"build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production"
+	},
+	"keywords": ["obsidian", "plugin", "file-explorer", "progress"],
+	"author": "Walter",
+	"license": "MIT",
+	"devDependencies": {
+		"@types/node": "^20.14.0",
+		"esbuild": "^0.25.0",
+		"obsidian": "^1.8.7",
+		"typescript": "^5.5.0"
+	}
+}

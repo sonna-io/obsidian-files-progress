@@ -1,0 +1,9 @@
+{
+	"id": "files-progress",
+	"name": "Files Progress",
+	"version": "1.0.0",
+	"minAppVersion": "1.5.0",
+	"description": "Tiny progress bars in the file explorer showing how full each note is, relative to a target character count.",
+	"author": "Walter",
+	"isDesktopOnly": false
+}
