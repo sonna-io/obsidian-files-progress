@@ -1,5 +1,13 @@
 import { Modal, Plugin, Setting, TFile, TFolder } from "obsidian";
-import { DEFAULT_SETTINGS, FilesProgressSettings, parentPath, progressColor } from "./types";
+import {
+	BUILT_IN_PALETTES,
+	DEFAULT_SETTINGS,
+	FilesProgressSettings,
+	FolderRule,
+	Palette,
+	paletteColor,
+	parentPath,
+} from "./types";
 import { FilesProgressSettingTab } from "./settings-tab";
 import { ProgressView, VIEW_TYPE_PROGRESS } from "./view";
 
@@ -44,8 +52,9 @@ export default class FilesProgressPlugin extends Plugin {
 		this.statusBarEl.onClickEvent(() => void this.activateView());
 		this.statusBarEl.hide();
 
-		// Fires on every content change of a markdown file and hands us the
-		// new content, so no extra disk read is needed.
+		// Fires on every content change of a markdown file and hands us the new
+		// content, so no extra disk read is needed. Frontmatter edits also land
+		// here, which keeps scope/target/palette properties live.
 		this.registerEvent(
 			this.app.metadataCache.on("changed", (file, data) => {
 				this.counts.set(file.path, this.countChars(data));
@@ -78,6 +87,7 @@ export default class FilesProgressPlugin extends Plugin {
 				const count = this.counts.get(oldPath);
 				this.counts.delete(oldPath);
 				if (count !== undefined) this.counts.set(file.path, count);
+				this.fixPathsOnRename(file.path, oldPath);
 				this.scheduleRefresh();
 				this.notifyView();
 			})
@@ -95,31 +105,42 @@ export default class FilesProgressPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu, file) => {
-				if (!(file instanceof TFolder) || file.path === "/") return;
-				menu.addSeparator();
-				menu.addItem((item) =>
-					item
-						.setTitle("Set progress target…")
-						.setIcon("gauge")
-						.onClick(() => new FolderTargetModal(this, file.path).open())
-				);
-				const isExcluded = this.settings.excludedFolders.some((f) => f.trim() === file.path);
-				menu.addItem((item) =>
-					item
-						.setTitle(isExcluded ? "Show progress bars" : "Hide progress bars")
-						.setIcon(isExcluded ? "eye" : "eye-off")
-						.onClick(async () => {
-							if (isExcluded) {
-								this.settings.excludedFolders = this.settings.excludedFolders.filter(
-									(f) => f.trim() !== file.path
-								);
-							} else {
-								this.settings.excludedFolders.push(file.path);
-							}
-							await this.saveSettings();
-							this.settingsChanged();
-						})
-				);
+				if (file instanceof TFolder && file.path !== "/") {
+					menu.addSeparator();
+					menu.addItem((item) =>
+						item
+							.setTitle("Progress settings…")
+							.setIcon("gauge")
+							.onClick(() => new FolderRuleModal(this, file.path).open())
+					);
+					const isExcluded = this.settings.excludedFolders.some(
+						(f) => f.trim() === file.path
+					);
+					menu.addItem((item) =>
+						item
+							.setTitle(isExcluded ? "Show progress bars" : "Hide progress bars")
+							.setIcon(isExcluded ? "eye" : "eye-off")
+							.onClick(async () => {
+								if (isExcluded) {
+									this.settings.excludedFolders = this.settings.excludedFolders.filter(
+										(f) => f.trim() !== file.path
+									);
+								} else {
+									this.settings.excludedFolders.push(file.path);
+								}
+								await this.saveSettings();
+								this.settingsChanged();
+							})
+					);
+				} else if (file instanceof TFile && file.extension === "md") {
+					const included = this.isIncluded(file.path);
+					menu.addItem((item) =>
+						item
+							.setTitle(included ? "Hide progress bar" : "Show progress bar")
+							.setIcon(included ? "eye-off" : "eye")
+							.onClick(() => void this.toggleFileScope(file.path))
+					);
+				}
 			})
 		);
 
@@ -132,6 +153,16 @@ export default class FilesProgressPlugin extends Plugin {
 			id: "open-view",
 			name: "Open progress view",
 			callback: () => void this.activateView(),
+		});
+		this.addCommand({
+			id: "toggle-file",
+			name: "Toggle progress bar for active note",
+			checkCallback: (checking) => {
+				const file = this.app.workspace.getActiveFile();
+				if (!file || file.extension !== "md") return false;
+				if (!checking) void this.toggleFileScope(file.path);
+				return true;
+			},
 		});
 
 		this.app.workspace.onLayoutReady(() => {
@@ -151,7 +182,19 @@ export default class FilesProgressPlugin extends Plugin {
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		const data = ((await this.loadData()) ?? {}) as Record<string, unknown>;
+		// 1.1.x stored per-folder targets in `folderTargets`; fold into folder rules.
+		if (Array.isArray(data.folderTargets) && !Array.isArray(data.folderRules)) {
+			data.folderRules = (data.folderTargets as { path: string; target: number }[]).map(
+				(t) => ({ path: t.path, target: t.target })
+			);
+			delete data.folderTargets;
+		}
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
+		// Clone palettes so edits never mutate the built-in constants.
+		this.settings.palettes = (
+			this.settings.palettes.length ? this.settings.palettes : BUILT_IN_PALETTES
+		).map((p) => ({ ...p }));
 	}
 
 	async saveSettings() {
@@ -170,7 +213,7 @@ export default class FilesProgressPlugin extends Plugin {
 		this.notifyView();
 	}
 
-	// ---------- scope & targets ----------
+	// ---------- scope ----------
 
 	private matchesFolder(path: string, folderRaw: string): boolean {
 		const folder = folderRaw.trim().replace(/^\/+|\/+$/g, "");
@@ -178,24 +221,128 @@ export default class FilesProgressPlugin extends Plugin {
 		return path === folder || path.startsWith(folder + "/");
 	}
 
+	/**
+	 * Scope precedence, most specific first:
+	 * excluded files > included files > frontmatter scope property >
+	 * excluded folders > included folders > default (in scope).
+	 */
 	isIncluded(path: string): boolean {
-		if (this.settings.excludedFolders.some((f) => this.matchesFolder(path, f))) return false;
-		const included = this.settings.includedFolders.filter((f) => f.trim());
+		const s = this.settings;
+		if (s.excludedFiles.some((f) => f.trim() === path)) return false;
+		if (s.includedFiles.some((f) => f.trim() === path)) return true;
+		const scopeKey = s.scopeProperty.trim();
+		if (scopeKey) {
+			const value = this.app.metadataCache.getCache(path)?.frontmatter?.[scopeKey];
+			if (value !== undefined && value !== null) {
+				return !(value === false || value === "false" || value === "no" || value === 0);
+			}
+		}
+		if (s.excludedFolders.some((f) => this.matchesFolder(path, f))) return false;
+		const included = s.includedFolders.filter((f) => f.trim());
 		if (included.length && !included.some((f) => this.matchesFolder(path, f))) return false;
 		return true;
 	}
 
+	/** Add or remove a file-level scope override so the bar toggles. */
+	async toggleFileScope(path: string) {
+		const s = this.settings;
+		if (this.isIncluded(path)) {
+			s.includedFiles = s.includedFiles.filter((f) => f.trim() !== path);
+			if (this.isIncluded(path)) s.excludedFiles.push(path);
+		} else {
+			s.excludedFiles = s.excludedFiles.filter((f) => f.trim() !== path);
+			if (!this.isIncluded(path)) s.includedFiles.push(path);
+		}
+		await this.saveSettings();
+		this.settingsChanged();
+	}
+
+	/** Keep scope lists and folder rules valid when files/folders are renamed. */
+	private fixPathsOnRename(newPath: string, oldPath: string) {
+		const s = this.settings;
+		let changed = false;
+		const fix = (p: string): string => {
+			const trimmed = p.trim();
+			if (trimmed === oldPath) {
+				changed = true;
+				return newPath;
+			}
+			if (trimmed.startsWith(oldPath + "/")) {
+				changed = true;
+				return newPath + trimmed.slice(oldPath.length);
+			}
+			return p;
+		};
+		s.includedFiles = s.includedFiles.map(fix);
+		s.excludedFiles = s.excludedFiles.map(fix);
+		s.includedFolders = s.includedFolders.map(fix);
+		s.excludedFolders = s.excludedFolders.map(fix);
+		for (const rule of s.folderRules) rule.path = fix(rule.path);
+		if (changed) void this.saveSettings();
+	}
+
+	// ---------- targets ----------
+
+	private folderRule(dir: string): FolderRule | undefined {
+		return this.settings.folderRules.find(
+			(r) => r.path.trim().replace(/^\/+|\/+$/g, "") === dir
+		);
+	}
+
 	targetFor(filePath: string): number {
+		const key = this.settings.targetProperty.trim();
+		if (key) {
+			const raw = this.app.metadataCache.getCache(filePath)?.frontmatter?.[key];
+			if (raw !== undefined && raw !== null) {
+				const parsed = Math.round(Number(raw));
+				if (Number.isFinite(parsed) && parsed > 0) return parsed;
+			}
+		}
 		return this.targetForFolder(parentPath(filePath));
 	}
 
 	targetForFolder(dir: string): number {
 		while (dir) {
-			const entry = this.settings.folderTargets.find((t) => t.path.trim().replace(/^\/+|\/+$/g, "") === dir);
-			if (entry && entry.target > 0) return entry.target;
+			const rule = this.folderRule(dir);
+			if (rule?.target && rule.target > 0) return rule.target;
 			dir = parentPath(dir);
 		}
 		return this.settings.targetChars;
+	}
+
+	// ---------- palettes ----------
+
+	private findPalette(name: unknown): Palette | undefined {
+		if (typeof name !== "string" || !name.trim()) return undefined;
+		const q = name.trim().toLowerCase();
+		return this.settings.palettes.find((p) => p.name.trim().toLowerCase() === q);
+	}
+
+	defaultPalette(): Palette {
+		return (
+			this.findPalette(this.settings.defaultPalette) ??
+			this.settings.palettes[0] ??
+			BUILT_IN_PALETTES[0]
+		);
+	}
+
+	paletteFor(filePath: string): Palette {
+		const key = this.settings.paletteProperty.trim();
+		if (key) {
+			const raw = this.app.metadataCache.getCache(filePath)?.frontmatter?.[key];
+			const palette = this.findPalette(raw);
+			if (palette) return palette;
+		}
+		return this.paletteForFolder(parentPath(filePath));
+	}
+
+	paletteForFolder(dir: string): Palette {
+		while (dir) {
+			const palette = this.findPalette(this.folderRule(dir)?.palette);
+			if (palette) return palette;
+			dir = parentPath(dir);
+		}
+		return this.defaultPalette();
 	}
 
 	// ---------- character counting ----------
@@ -380,7 +527,7 @@ export default class FilesProgressPlugin extends Plugin {
 				const entry = folderAgg.get(path);
 				const abstract = this.app.vault.getAbstractFileByPath(path);
 				if (entry && entry.n > 0 && abstract instanceof TFolder) {
-					this.applyBar(el, entry.sum / entry.n, true);
+					this.applyBar(el, entry.sum / entry.n, true, this.paletteForFolder(path));
 					return;
 				}
 			}
@@ -401,10 +548,10 @@ export default class FilesProgressPlugin extends Plugin {
 
 		const target = this.targetFor(path);
 		const ratio = count !== undefined && target > 0 ? count / target : 0;
-		this.applyBar(el, ratio, false);
+		this.applyBar(el, ratio, false, this.paletteFor(path));
 	}
 
-	private applyBar(el: HTMLElement, ratio: number, isFolder: boolean) {
+	private applyBar(el: HTMLElement, ratio: number, isFolder: boolean, palette: Palette) {
 		el.addClass("ofp-host");
 		let bar = el.querySelector(":scope > .ofp-bar") as HTMLElement | null;
 		if (!bar) {
@@ -421,7 +568,7 @@ export default class FilesProgressPlugin extends Plugin {
 		if (ratio > 0 && widthPct < 3) widthPct = 3;
 
 		const width = `${widthPct.toFixed(1)}%`;
-		const color = progressColor(ratio, highlightOverflow);
+		const color = paletteColor(palette, ratio, highlightOverflow);
 
 		// Obsidian indents rows with an inline padding-inline-start; mirror it
 		// so the bar starts exactly under the file name.
@@ -444,8 +591,8 @@ export default class FilesProgressPlugin extends Plugin {
 	}
 }
 
-/** Modal opened from the folder context menu to set a per-folder target. */
-export class FolderTargetModal extends Modal {
+/** Modal opened from the folder context menu: per-folder target and palette. */
+export class FolderRuleModal extends Modal {
 	private plugin: FilesProgressPlugin;
 	private folderPath: string;
 
@@ -456,16 +603,31 @@ export class FolderTargetModal extends Modal {
 	}
 
 	onOpen() {
-		this.setTitle(`Progress target — ${this.folderPath}`);
-		const existing = this.plugin.settings.folderTargets.find((t) => t.path === this.folderPath);
-		let value = existing
-			? String(existing.target)
-			: String(this.plugin.targetForFolder(this.folderPath));
+		this.setTitle(`Progress settings — ${this.folderPath}`);
+		const existing = this.plugin.settings.folderRules.find((r) => r.path === this.folderPath);
+		const parent = parentPath(this.folderPath);
+		const inheritedTarget = this.plugin.targetForFolder(parent);
+		const inheritedPalette = this.plugin.paletteForFolder(parent).name;
+		let targetValue = existing?.target ? String(existing.target) : "";
+		let paletteValue = existing?.palette ?? "";
 
 		new Setting(this.contentEl)
 			.setName("Target character count")
-			.setDesc("Applies to all notes in this folder and its subfolders.")
-			.addText((text) => text.setValue(value).onChange((v) => (value = v)));
+			.setDesc(
+				`Applies to all notes in this folder and its subfolders. Leave empty to inherit (${inheritedTarget.toLocaleString()}).`
+			)
+			.addText((text) =>
+				text.setPlaceholder("Inherit").setValue(targetValue).onChange((v) => (targetValue = v))
+			);
+
+		new Setting(this.contentEl)
+			.setName("Color palette")
+			.setDesc(`Leave on “Inherit” to use the inherited palette (${inheritedPalette}).`)
+			.addDropdown((dropdown) => {
+				dropdown.addOption("", "Inherit");
+				for (const p of this.plugin.settings.palettes) dropdown.addOption(p.name, p.name);
+				dropdown.setValue(paletteValue).onChange((v) => (paletteValue = v));
+			});
 
 		const buttons = new Setting(this.contentEl);
 		buttons.addButton((button) =>
@@ -473,13 +635,17 @@ export class FolderTargetModal extends Modal {
 				.setButtonText("Save")
 				.setCta()
 				.onClick(async () => {
-					const parsed = Math.round(Number(value));
-					if (!Number.isFinite(parsed) || parsed <= 0) return;
-					const entry = this.plugin.settings.folderTargets.find(
-						(t) => t.path === this.folderPath
-					);
-					if (entry) entry.target = parsed;
-					else this.plugin.settings.folderTargets.push({ path: this.folderPath, target: parsed });
+					const parsed = Math.round(Number(targetValue));
+					const hasTarget =
+						targetValue.trim() !== "" && Number.isFinite(parsed) && parsed > 0;
+					const s = this.plugin.settings;
+					s.folderRules = s.folderRules.filter((r) => r.path !== this.folderPath);
+					if (hasTarget || paletteValue) {
+						const rule: FolderRule = { path: this.folderPath };
+						if (hasTarget) rule.target = parsed;
+						if (paletteValue) rule.palette = paletteValue;
+						s.folderRules.push(rule);
+					}
 					await this.plugin.saveSettings();
 					this.plugin.settingsChanged();
 					this.close();
@@ -491,8 +657,8 @@ export class FolderTargetModal extends Modal {
 					.setButtonText("Remove override")
 					.setWarning()
 					.onClick(async () => {
-						this.plugin.settings.folderTargets = this.plugin.settings.folderTargets.filter(
-							(t) => t.path !== this.folderPath
+						this.plugin.settings.folderRules = this.plugin.settings.folderRules.filter(
+							(r) => r.path !== this.folderPath
 						);
 						await this.plugin.saveSettings();
 						this.plugin.settingsChanged();

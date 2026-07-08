@@ -174,5 +174,14 @@
 }
 
 .ofp-list-item input[type="number"] {
-	width: 8em;
+	width: 7em;
+}
+
+.ofp-list-item .setting-item-control input[type="text"] {
+	flex: 1 1 auto;
+	min-width: 0;
+}
+
+.ofp-list-item .setting-item-control select.dropdown {
+	max-width: 11em;
 }

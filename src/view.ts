@@ -1,6 +1,6 @@
 import { ItemView, Keymap, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import type FilesProgressPlugin from "./main";
-import { ViewSort, parentPath, progressColor } from "./types";
+import { ViewSort, paletteColor, parentPath } from "./types";
 
 export const VIEW_TYPE_PROGRESS = "files-progress-view";
 
@@ -226,7 +226,11 @@ export class ProgressView extends ItemView {
 		let widthPct = Math.min(1, row.ratio) * 100;
 		if (row.ratio > 0 && widthPct < 2) widthPct = 2;
 		fill.style.width = `${widthPct.toFixed(1)}%`;
-		fill.style.backgroundColor = progressColor(row.ratio, this.plugin.settings.highlightOverflow);
+		fill.style.backgroundColor = paletteColor(
+			this.plugin.paletteFor(row.file.path),
+			row.ratio,
+			this.plugin.settings.highlightOverflow
+		);
 
 		rowEl.addEventListener("click", (evt) => {
 			void this.plugin.app.workspace.getLeaf(Keymap.isModEvent(evt)).openFile(row.file);
