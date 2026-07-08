@@ -1,6 +1,6 @@
 import { ItemView, Keymap, TFile, WorkspaceLeaf, setIcon } from "obsidian";
 import type FilesProgressPlugin from "./main";
-import { ViewSort, paletteColor, parentPath } from "./types";
+import { ViewSort, isDarkTheme, paletteColor, parentPath, resolveColors } from "./types";
 
 export const VIEW_TYPE_PROGRESS = "files-progress-view";
 
@@ -20,9 +20,81 @@ interface Row {
 	ratio: number;
 }
 
+interface PathFilter {
+	test: (path: string) => boolean;
+	error?: string;
+}
+
+interface FilterFlags {
+	matchCase: boolean;
+	wholeWord: boolean;
+	useRegex: boolean;
+}
+
+function escapeRegex(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function globToRegexSource(glob: string): string {
+	const parts = glob.split(/(\*\*|\*|\?)/).map((part) => {
+		if (part === "**") return ".*";
+		if (part === "*") return "[^/]*";
+		if (part === "?") return "[^/]";
+		return escapeRegex(part);
+	});
+	return `^${parts.join("")}$`;
+}
+
+/**
+ * VS Code-style filter: comma-separated terms, `*`/`?`/`**` globs matched
+ * against the full path or the file name, `!` prefix excludes, plain terms
+ * are substring matches. Regex mode treats the whole query as one pattern.
+ */
+export function buildPathFilter(query: string, flags: FilterFlags): PathFilter {
+	const q = query.trim();
+	if (!q) return { test: () => true };
+	const reFlags = flags.matchCase ? "" : "i";
+
+	if (flags.useRegex) {
+		try {
+			const source = flags.wholeWord ? `\\b(?:${q})\\b` : q;
+			const re = new RegExp(source, reFlags);
+			return { test: (path) => re.test(path) };
+		} catch {
+			return { test: () => false, error: "Invalid regular expression" };
+		}
+	}
+
+	const includes: RegExp[] = [];
+	const excludes: RegExp[] = [];
+	for (const rawTerm of q.split(",")) {
+		const term = rawTerm.trim();
+		if (!term) continue;
+		const negated = term.startsWith("!");
+		const body = negated ? term.slice(1).trim() : term;
+		if (!body) continue;
+		let source = /[*?]/.test(body) ? globToRegexSource(body) : escapeRegex(body);
+		if (flags.wholeWord && !source.startsWith("^")) source = `\\b(?:${source})\\b`;
+		(negated ? excludes : includes).push(new RegExp(source, reFlags));
+	}
+
+	return {
+		test: (path) => {
+			const base = path.slice(path.lastIndexOf("/") + 1);
+			const hit = (re: RegExp) => re.test(path) || re.test(base);
+			if (excludes.some(hit)) return false;
+			if (includes.length && !includes.some(hit)) return false;
+			return true;
+		},
+	};
+}
+
 export class ProgressView extends ItemView {
 	private plugin: FilesProgressPlugin;
 	private query = "";
+	private matchCase = false;
+	private wholeWord = false;
+	private useRegex = false;
 	private collapsedGroups = new Set<string>();
 	private renderTimer: number | null = null;
 	private statsEl!: HTMLElement;
@@ -85,14 +157,44 @@ export class ProgressView extends ItemView {
 		setIcon(refreshBtn, "rotate-cw");
 		refreshBtn.onclick = () => void this.plugin.scanVault(true);
 
-		const search = el.createEl("input", {
+		const searchWrap = el.createDiv({ cls: "ofp-search-wrap" });
+		const search = searchWrap.createEl("input", {
 			cls: "ofp-search",
-			attr: { type: "search", placeholder: "Filter notes…" },
+			attr: {
+				type: "search",
+				placeholder: "Filter (e.g. daily*, !archive)",
+				"aria-label":
+					"Comma-separated terms. Plain terms match anywhere in the path; * ? ** are globs; !term excludes.",
+			},
 		});
+		search.value = this.query;
 		search.oninput = () => {
 			this.query = search.value;
 			this.renderList();
 		};
+
+		const toggles = searchWrap.createDiv({ cls: "ofp-search-toggles" });
+		const makeToggle = (
+			icon: string,
+			label: string,
+			get: () => boolean,
+			set: (value: boolean) => void
+		) => {
+			const btn = toggles.createEl("button", {
+				cls: "clickable-icon ofp-toggle",
+				attr: { "aria-label": label },
+			});
+			setIcon(btn, icon);
+			btn.toggleClass("is-active", get());
+			btn.onclick = () => {
+				set(!get());
+				btn.toggleClass("is-active", get());
+				this.renderList();
+			};
+		};
+		makeToggle("case-sensitive", "Match case", () => this.matchCase, (v) => (this.matchCase = v));
+		makeToggle("whole-word", "Match whole word", () => this.wholeWord, (v) => (this.wholeWord = v));
+		makeToggle("regex", "Use regular expression", () => this.useRegex, (v) => (this.useRegex = v));
 
 		this.statsEl = el.createDiv({ cls: "ofp-stats" });
 		this.listEl = el.createDiv({ cls: "ofp-list" });
@@ -111,17 +213,17 @@ export class ProgressView extends ItemView {
 		}, 250);
 	}
 
-	private collectRows(): Row[] {
+	private collectRows(filter: PathFilter): Row[] {
 		const rows: Row[] = [];
 		for (const file of this.plugin.app.vault.getMarkdownFiles()) {
 			if (!this.plugin.isIncluded(file.path)) continue;
+			if (!filter.test(file.path)) continue;
 			const count = this.plugin.counts.get(file.path);
 			if (count === undefined) continue;
 			const target = this.plugin.targetFor(file.path);
 			rows.push({ file, count, target, ratio: target > 0 ? count / target : 0 });
 		}
-		const q = this.query.trim().toLowerCase();
-		return q ? rows.filter((r) => r.file.path.toLowerCase().includes(q)) : rows;
+		return rows;
 	}
 
 	private sortRows(rows: Row[]) {
@@ -137,11 +239,24 @@ export class ProgressView extends ItemView {
 	}
 
 	private renderList() {
-		const rows = this.collectRows();
+		const filter = buildPathFilter(this.query, {
+			matchCase: this.matchCase,
+			wholeWord: this.wholeWord,
+			useRegex: this.useRegex,
+		});
 
-		const clamped = rows.map((r) => Math.min(1, r.ratio));
+		this.listEl.empty();
+		if (filter.error) {
+			this.statsEl.setText(filter.error);
+			return;
+		}
+
+		const rows = this.collectRows(filter);
+
 		const avg = rows.length
-			? Math.round((clamped.reduce((a, b) => a + b, 0) / rows.length) * 100)
+			? Math.round(
+					(rows.reduce((a, r) => a + Math.min(1, r.ratio), 0) / rows.length) * 100
+			  )
 			: 0;
 		const full = rows.filter((r) => r.ratio >= 1).length;
 		const over = rows.filter((r) => r.ratio > 1).length;
@@ -151,11 +266,10 @@ export class ProgressView extends ItemView {
 				: ""
 		);
 
-		this.listEl.empty();
 		if (!rows.length) {
 			this.listEl.createDiv({
 				cls: "ofp-empty",
-				text: this.query ? "No notes match the filter." : "No notes in scope yet.",
+				text: this.query.trim() ? "No notes match the filter." : "No notes in scope yet.",
 			});
 			return;
 		}
@@ -221,13 +335,15 @@ export class ProgressView extends ItemView {
 			if (dir) rowEl.createDiv({ cls: "ofp-row-path", text: dir });
 		}
 
+		const colors = resolveColors(this.plugin.paletteFor(row.file.path), isDarkTheme());
 		const track = rowEl.createDiv({ cls: "ofp-row-track" });
+		if (colors.track.trim()) track.style.backgroundColor = colors.track;
 		const fill = track.createDiv({ cls: "ofp-row-fill" });
 		let widthPct = Math.min(1, row.ratio) * 100;
 		if (row.ratio > 0 && widthPct < 2) widthPct = 2;
 		fill.style.width = `${widthPct.toFixed(1)}%`;
 		fill.style.backgroundColor = paletteColor(
-			this.plugin.paletteFor(row.file.path),
+			colors,
 			row.ratio,
 			this.plugin.settings.highlightOverflow
 		);

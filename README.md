@@ -6,8 +6,9 @@ An Obsidian plugin that enhances the file explorer with the tiniest possible hor
 
 - **Tiny, seamless bars** — a 2px (configurable 1–4px) bar rendered inside Obsidian's native file explorer rows, aligned with the file name indentation, using theme variables so it blends with any theme.
 - **Fullness by character count** — a note is 100% full at the target character count (default **3600**, configurable globally, per folder, and per note via frontmatter).
-- **Custom color palettes** — palettes define the colors at 0%, 50%, 100%, and past the target, blended smoothly in between. Three presets ship (Default red→yellow→green, Ocean, Violet); create, edit, and delete palettes with color pickers. Assign a default palette, per-folder palettes, or a per-note palette via frontmatter.
-- **Progress view** — a sidebar view listing every note in scope with its completion. Sort by completion, name, folder path, character count, or recent modification; group by folder (collapsible, with per-folder averages); filter by name; see vault-wide stats (average completion, notes at/over target). Click a row to open the note.
+- **Custom color palettes** — palettes define the colors at 0%, 50%, 100%, past the target, and the **gauge background** (empty part), blended smoothly in between. The background defaults to Obsidian's theme-aware track color. Each palette can carry an optional **dark-mode variant**, picked automatically from Obsidian's appearance setting (light/dark/adapt-to-system). Three presets ship (Default red→yellow→green, Ocean, Violet); create, edit, and delete palettes with color pickers. Assign a default palette, per-folder palettes, or a per-note palette via frontmatter.
+- **Progress view** — a sidebar view listing every note in scope with its completion. Sort by completion, name, folder path, character count, or recent modification; group by folder (collapsible, with per-folder averages); see vault-wide stats (average completion, notes at/over target). Click a row to open the note. The gauges follow the thickness and palette settings.
+- **VS Code-style filtering** — the view's filter box supports comma-separated terms, `*`/`?`/`**` globs (matched against the path or file name), `!term` exclusions, and the familiar toggle trio: match case, whole word, and regular expression.
 - **Folder & file scoping** — include only specific folders, exclude folders, and force-include or force-exclude individual notes. Togglable from the context menu of any folder or note, or with the "Toggle progress bar for active note" command. Scope lists follow file renames automatically.
 - **Frontmatter control** — three configurable properties: `progress` (include/exclude a note: any value includes, `false`/`no` excludes — overrides folder scope), `progress-target` (per-note target character count), and `progress-palette` (per-note palette by name).
 - **Per-folder overrides** — give any folder its own target and/or palette; the nearest ancestor override wins. Configurable in settings or from the folder context menu ("Progress settings…").
@@ -27,7 +28,7 @@ An Obsidian plugin that enhances the file explorer with the tiniest possible hor
 | Folder progress bars | off | Aggregate (average) bar on folders |
 | Status bar | on | Character count / target for the active note |
 | Default palette | Default | Palette used when nothing overrides it |
-| Palettes | 3 presets | Editable palettes: 0% · 50% · 100% · overflow colors |
+| Palettes | 3 presets | Editable palettes: 0% · 50% · 100% · overflow · background colors, with optional dark-mode variants |
 | Included / excluded folders | — | Folder-level scope |
 | Included / excluded files | — | Note-level scope (strongest) |
 | Scope property | `progress` | Frontmatter include/exclude keyword |

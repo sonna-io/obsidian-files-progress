@@ -1,5 +1,4 @@
-export interface Palette {
-	name: string;
+export interface PaletteColors {
 	/** Color at 0% fullness. */
 	start: string;
 	/** Color at 50% fullness. */
@@ -8,6 +7,15 @@ export interface Palette {
 	end: string;
 	/** Color past the target (when overflow highlighting is on). */
 	overflow: string;
+	/** Gauge background (the empty part); "" inherits the theme-aware default. */
+	track: string;
+}
+
+export interface Palette {
+	name: string;
+	light: PaletteColors;
+	/** Optional dark-theme variant; falls back to `light` when absent. */
+	dark?: PaletteColors;
 }
 
 export interface FolderRule {
@@ -47,9 +55,18 @@ export interface FilesProgressSettings {
 
 export const BUILT_IN_PALETTES: Palette[] = [
 	// "Default" matches the pre-1.2 hsl(0→120, 70%, 45%) gradient.
-	{ name: "Default", start: "#c32222", mid: "#c3c322", end: "#22c322", overflow: "#a882ff" },
-	{ name: "Ocean", start: "#74c0fc", mid: "#339af0", end: "#1864ab", overflow: "#e64980" },
-	{ name: "Violet", start: "#d0bfff", mid: "#845ef7", end: "#5f3dc4", overflow: "#e8590c" },
+	{
+		name: "Default",
+		light: { start: "#c32222", mid: "#c3c322", end: "#22c322", overflow: "#a882ff", track: "" },
+	},
+	{
+		name: "Ocean",
+		light: { start: "#74c0fc", mid: "#339af0", end: "#1864ab", overflow: "#e64980", track: "" },
+	},
+	{
+		name: "Violet",
+		light: { start: "#d0bfff", mid: "#845ef7", end: "#5f3dc4", overflow: "#e8590c", track: "" },
+	},
 ];
 
 export const DEFAULT_SETTINGS: FilesProgressSettings = {
@@ -73,6 +90,15 @@ export const DEFAULT_SETTINGS: FilesProgressSettings = {
 	viewGroupByFolder: false,
 };
 
+/** Effective theme, honoring Obsidian's light/dark/system appearance setting. */
+export function isDarkTheme(): boolean {
+	return document.body.classList.contains("theme-dark");
+}
+
+export function resolveColors(palette: Palette, dark: boolean): PaletteColors {
+	return dark && palette.dark ? palette.dark : palette.light;
+}
+
 function parseColor(hex: string): [number, number, number] | null {
 	const match = hex.trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
 	if (!match) return null;
@@ -90,12 +116,16 @@ function mix(a: string, b: string, t: number): string {
 	return `rgb(${c[0]}, ${c[1]}, ${c[2]})`;
 }
 
-export function paletteColor(palette: Palette, ratio: number, highlightOverflow: boolean): string {
-	if (ratio > 1 && highlightOverflow) return palette.overflow;
+export function paletteColor(
+	colors: PaletteColors,
+	ratio: number,
+	highlightOverflow: boolean
+): string {
+	if (ratio > 1 && highlightOverflow) return colors.overflow;
 	const t = Math.max(0, Math.min(1, ratio));
 	return t <= 0.5
-		? mix(palette.start, palette.mid, t * 2)
-		: mix(palette.mid, palette.end, (t - 0.5) * 2);
+		? mix(colors.start, colors.mid, t * 2)
+		: mix(colors.mid, colors.end, (t - 0.5) * 2);
 }
 
 export function parentPath(path: string): string {

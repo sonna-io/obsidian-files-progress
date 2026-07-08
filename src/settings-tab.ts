@@ -8,7 +8,7 @@ import {
 	TFolder,
 } from "obsidian";
 import type FilesProgressPlugin from "./main";
-import { Palette } from "./types";
+import { Palette, PaletteColors } from "./types";
 
 class FolderSuggest extends AbstractInputSuggest<TFolder> {
 	private textInputEl: HTMLInputElement;
@@ -191,7 +191,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 
 		new Setting(containerEl)
 			.setName("Palettes")
-			.setDesc("Colors, in order: empty (0%) · halfway (50%) · full (100%) · over target. Fullness blends smoothly between the first three.")
+			.setDesc("Colors, in order: empty (0%) · halfway (50%) · full (100%) · over target · gauge background. Fullness blends smoothly between the first three. The gauge background defaults to Obsidian's theme-aware track color (reset button restores it). The moon button adds a dark-mode variant, used automatically when Obsidian's appearance (including “adapt to system”) resolves to dark.")
 			.addButton((button) =>
 				button.setButtonText("Add palette").onClick(async () => {
 					let name = "New palette";
@@ -200,10 +200,13 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 					}
 					this.plugin.settings.palettes.push({
 						name,
-						start: "#c32222",
-						mid: "#c3c322",
-						end: "#22c322",
-						overflow: "#a882ff",
+						light: {
+							start: "#c32222",
+							mid: "#c3c322",
+							end: "#22c322",
+							overflow: "#a882ff",
+							track: "",
+						},
 					});
 					await this.plugin.saveSettings();
 					this.display();
@@ -211,8 +214,25 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 			);
 
 		this.plugin.settings.palettes.forEach((palette, index) => {
-			const row = new Setting(containerEl);
-			row.setClass("ofp-list-item");
+			this.renderPaletteRow(containerEl, palette, index, false);
+			if (palette.dark) this.renderPaletteRow(containerEl, palette, index, true);
+		});
+	}
+
+	private renderPaletteRow(
+		containerEl: HTMLElement,
+		palette: Palette,
+		index: number,
+		isDark: boolean
+	) {
+		const colors = isDark ? palette.dark! : palette.light;
+		const row = new Setting(containerEl);
+		row.setClass("ofp-list-item");
+
+		if (isDark) {
+			row.setClass("ofp-palette-dark");
+			row.controlEl.createSpan({ cls: "ofp-palette-label", text: "Dark" });
+		} else {
 			row.addText((text) =>
 				text
 					.setPlaceholder("Palette name")
@@ -226,14 +246,60 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						this.plugin.settingsChanged();
 					})
 			);
-			const colorKeys: (keyof Omit<Palette, "name">)[] = ["start", "mid", "end", "overflow"];
-			for (const key of colorKeys) {
-				row.addColorPicker((picker) =>
-					picker.setValue(palette[key]).onChange(async (value) => {
-						palette[key] = value;
-						await this.plugin.saveSettings();
-						this.plugin.settingsChanged();
-					})
+		}
+
+		const colorKeys: (keyof Omit<PaletteColors, "track">)[] = [
+			"start",
+			"mid",
+			"end",
+			"overflow",
+		];
+		for (const key of colorKeys) {
+			row.addColorPicker((picker) =>
+				picker.setValue(colors[key]).onChange(async (value) => {
+					colors[key] = value;
+					await this.plugin.saveSettings();
+					this.plugin.settingsChanged();
+				})
+			);
+		}
+
+		row.addColorPicker((picker) =>
+			picker.setValue(colors.track || "#808080").onChange(async (value) => {
+				colors.track = value;
+				await this.plugin.saveSettings();
+				this.plugin.settingsChanged();
+			})
+		);
+		row.addExtraButton((button) =>
+			button
+				.setIcon("rotate-ccw")
+				.setTooltip(
+					colors.track
+						? "Reset gauge background to theme default"
+						: "Gauge background: theme default"
+				)
+				.onClick(async () => {
+					if (!colors.track) return;
+					colors.track = "";
+					await this.plugin.saveSettings();
+					this.plugin.settingsChanged();
+					this.display();
+				})
+		);
+
+		if (!isDark) {
+			if (!palette.dark) {
+				row.addExtraButton((button) =>
+					button
+						.setIcon("moon")
+						.setTooltip("Add dark mode variant")
+						.onClick(async () => {
+							palette.dark = { ...palette.light };
+							await this.plugin.saveSettings();
+							this.plugin.settingsChanged();
+							this.display();
+						})
 				);
 			}
 			row.addExtraButton((button) =>
@@ -255,7 +321,19 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						this.display();
 					})
 			);
-		});
+		} else {
+			row.addExtraButton((button) =>
+				button
+					.setIcon("x")
+					.setTooltip("Remove dark variant")
+					.onClick(async () => {
+						delete palette.dark;
+						await this.plugin.saveSettings();
+						this.plugin.settingsChanged();
+						this.display();
+					})
+			);
+		}
 	}
 
 	private renamePaletteReferences(oldName: string, newName: string) {

@@ -5,8 +5,10 @@ import {
 	FilesProgressSettings,
 	FolderRule,
 	Palette,
+	isDarkTheme,
 	paletteColor,
 	parentPath,
+	resolveColors,
 } from "./types";
 import { FilesProgressSettingTab } from "./settings-tab";
 import { ProgressView, VIEW_TYPE_PROGRESS } from "./view";
@@ -96,6 +98,15 @@ export default class FilesProgressPlugin extends Plugin {
 		// Catches newly created explorer leaves and deferred views finishing loading.
 		this.registerEvent(
 			this.app.workspace.on("layout-change", () => this.attachToExplorers())
+		);
+
+		// Re-resolve palettes when the theme flips between light and dark
+		// (including "adapt to system" switches).
+		this.registerEvent(
+			this.app.workspace.on("css-change", () => {
+				this.scheduleRefresh();
+				this.notifyView();
+			})
 		);
 
 		this.registerEvent(
@@ -190,11 +201,32 @@ export default class FilesProgressPlugin extends Plugin {
 			);
 			delete data.folderTargets;
 		}
+		// 1.2.x palettes stored flat colors; wrap them as the light variant.
+		if (Array.isArray(data.palettes)) {
+			data.palettes = (data.palettes as any[]).map((p: any) =>
+				p && typeof p === "object" && "light" in p
+					? p
+					: {
+							name: p.name,
+							light: {
+								start: p.start,
+								mid: p.mid,
+								end: p.end,
+								overflow: p.overflow,
+								track: "",
+							},
+					  }
+			);
+		}
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
 		// Clone palettes so edits never mutate the built-in constants.
 		this.settings.palettes = (
 			this.settings.palettes.length ? this.settings.palettes : BUILT_IN_PALETTES
-		).map((p) => ({ ...p }));
+		).map((p) => ({
+			name: p.name,
+			light: { ...p.light, track: p.light.track ?? "" },
+			dark: p.dark ? { ...p.dark, track: p.dark.track ?? "" } : undefined,
+		}));
 	}
 
 	async saveSettings() {
@@ -568,19 +600,23 @@ export default class FilesProgressPlugin extends Plugin {
 		if (ratio > 0 && widthPct < 3) widthPct = 3;
 
 		const width = `${widthPct.toFixed(1)}%`;
-		const color = paletteColor(palette, ratio, highlightOverflow);
+		const colors = resolveColors(palette, isDarkTheme());
+		const color = paletteColor(colors, ratio, highlightOverflow);
+		const track = colors.track.trim();
 
 		// Obsidian indents rows with an inline padding-inline-start; mirror it
 		// so the bar starts exactly under the file name.
 		const inset = el.style.paddingInlineStart || "";
 
-		const signature = `${width}|${color}|${inset}|${isFolder}`;
+		const signature = `${width}|${color}|${inset}|${isFolder}|${track}`;
 		if (bar.dataset.ofp === signature) return;
 		bar.dataset.ofp = signature;
 
 		if (inset) bar.style.insetInlineStart = inset;
 		fill.style.width = width;
 		fill.style.backgroundColor = color;
+		// Empty string clears the inline override → theme-aware CSS default.
+		bar.style.backgroundColor = track;
 		bar.toggleClass("ofp-overflow", overflow);
 		bar.toggleClass("ofp-folder-bar", isFolder);
 	}
