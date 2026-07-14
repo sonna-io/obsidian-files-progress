@@ -1,89 +1,192 @@
-# publish.ps1 — one-shot publication of the Files Progress plugin.
+# publish.ps1 — safely start an attested Files Progress release.
 #
-# Does, in order:
-#   1. Builds the plugin (type-check + bundle)
-#   2. Creates the public GitHub repo (if missing) and pushes the code
-#   3. Creates the GitHub release <version> with main.js / manifest.json / styles.css
-#      -> from this moment the plugin is installable via BRAT or manual download
-#   4. Opens the Obsidian community portal for the directory submission.
-#      NOTE: Obsidian no longer accepts pull requests to obsidianmd/obsidian-releases
-#      (the repo's PR-creation policy is collaborators-only). New plugins are
-#      submitted through a web form that requires signing in with your Obsidian
-#      account and linking your GitHub account — a manual, one-time browser step.
-#      See https://docs.obsidian.md/Plugins/Releasing/Submit+your+plugin
+# The script performs local preflight checks, builds once as a sanity check,
+# pushes main, and pushes the bare version tag required by Obsidian. The tag
+# triggers .github/workflows/release.yml, which rebuilds from the tagged source,
+# attests the release assets, and creates the GitHub release.
 #
-# Prerequisite: gh auth login
+# Prerequisites: gh auth login; a clean, committed main branch; and version
+# metadata updated consistently in manifest.json, package.json, and versions.json.
 
 $ErrorActionPreference = "Stop"
 $PluginDir = $PSScriptRoot
 Set-Location $PluginDir
 
-# --- 0. Preconditions -------------------------------------------------------
-gh auth status *> $null
-if ($LASTEXITCODE -ne 0) { throw "Not logged in to GitHub. Run: gh auth login" }
-$login = (gh api user -q .login).Trim()
-$manifest = Get-Content "$PluginDir\manifest.json" -Raw | ConvertFrom-Json
-$version = $manifest.version
-$repoName = "obsidian-files-progress"
-$repoSlug = "$login/$repoName"
-Write-Host "Publishing $($manifest.name) v$version as $repoSlug (user: $login)" -ForegroundColor Cyan
+function Assert-LastExitCode {
+    param([string] $Message)
 
-# --- 1. Build ---------------------------------------------------------------
-npm run build
-if ($LASTEXITCODE -ne 0) { throw "Build failed" }
-
-# --- 2. Repo + push ---------------------------------------------------------
-$hasOrigin = (git remote) -contains "origin"
-if (-not $hasOrigin) {
-    gh repo view $repoSlug *> $null
-    if ($LASTEXITCODE -eq 0) {
-        git remote add origin "https://github.com/$repoSlug.git"
-        git push -u origin main
-    } else {
-        gh repo create $repoSlug --public --source . --push `
-            --description "Obsidian plugin: tiny fullness progress bars in the file explorer"
-        if ($LASTEXITCODE -ne 0) { throw "Repo creation failed" }
+    if ($LASTEXITCODE -ne 0) {
+        throw $Message
     }
-} else {
-    git push -u origin main
 }
 
-# --- 3. Release (makes the plugin installable via BRAT immediately) ---------
+# --- 0. Preconditions -------------------------------------------------------
+foreach ($command in @("git", "npm", "gh")) {
+    if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
+        throw "Required command '$command' was not found on PATH."
+    }
+}
+
+gh auth status *> $null
+Assert-LastExitCode "Not logged in to GitHub. Run: gh auth login"
+
+git rev-parse --is-inside-work-tree *> $null
+Assert-LastExitCode "publish.ps1 must be run from a Git repository."
+
+$branchOutput = git branch --show-current
+Assert-LastExitCode "Could not determine the current Git branch."
+$branch = ([string] $branchOutput).Trim()
+if ($branch -ne "main") {
+    throw "Releases must be published from main; current branch is '$branch'."
+}
+
+$changes = @(git status --short --untracked-files=all)
+Assert-LastExitCode "Could not inspect the Git working tree."
+if ($changes.Count -gt 0) {
+    throw "The working tree must be clean before publishing. Commit or stash these changes:`n$($changes -join "`n")"
+}
+
+git ls-files --error-unmatch -- ".github/workflows/release.yml" *> $null
+Assert-LastExitCode "The release workflow must be committed before publishing."
+
+$manifest = Get-Content "$PluginDir\manifest.json" -Raw | ConvertFrom-Json
+$packageJson = Get-Content "$PluginDir\package.json" -Raw | ConvertFrom-Json
+$versions = Get-Content "$PluginDir\versions.json" -Raw | ConvertFrom-Json
+$version = [string] $manifest.version
+
+if ($version -notmatch '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$') {
+    throw "manifest.json version '$version' is not a bare semantic version. Do not prefix release tags with 'v'."
+}
+if ([string] $packageJson.version -ne $version) {
+    throw "package.json version '$($packageJson.version)' does not match manifest.json version '$version'."
+}
+
+$versionEntry = $versions.PSObject.Properties |
+    Where-Object { $_.Name -eq $version } |
+    Select-Object -First 1
+if ($null -eq $versionEntry -or [string] $versionEntry.Value -ne [string] $manifest.minAppVersion) {
+    throw "versions.json must map '$version' to minAppVersion '$($manifest.minAppVersion)'."
+}
+
+git remote get-url origin *> $null
+Assert-LastExitCode "An 'origin' Git remote is required before publishing."
+
+$repoJson = gh repo view --json nameWithOwner,visibility,defaultBranchRef,url
+Assert-LastExitCode "Could not resolve the GitHub repository from the origin remote."
+$repo = $repoJson | ConvertFrom-Json
+$repoSlug = [string] $repo.nameWithOwner
+if ([string] $repo.visibility -ne "PUBLIC") {
+    throw "The Obsidian plugin repository must be public before publishing."
+}
+if ([string] $repo.defaultBranchRef.name -ne "main") {
+    throw "The GitHub repository default branch must be 'main'."
+}
+
+$login = (gh api user -q .login).Trim()
+Assert-LastExitCode "Could not determine the authenticated GitHub user."
+
+Write-Host "Preparing $($manifest.name) $version for $repoSlug (user: $login)" -ForegroundColor Cyan
+
+# Fetch first so stale or conflicting local state cannot be released.
+git fetch origin main --tags
+Assert-LastExitCode "Could not fetch origin/main and release tags."
+
+$localHead = (git rev-parse HEAD).Trim()
+Assert-LastExitCode "Could not resolve local HEAD."
+$remoteHead = (git rev-parse refs/remotes/origin/main).Trim()
+Assert-LastExitCode "Could not resolve origin/main."
+if ($localHead -ne $remoteHead) {
+    $mergeBase = (git merge-base HEAD refs/remotes/origin/main).Trim()
+    Assert-LastExitCode "Could not compare local main with origin/main."
+    if ($mergeBase -ne $remoteHead) {
+        throw "Local main is behind or has diverged from origin/main. Synchronize it before publishing."
+    }
+}
+
+git show-ref --verify --quiet "refs/tags/$version"
+if ($LASTEXITCODE -eq 0) {
+    throw "Local tag '$version' already exists. Version tags are immutable; bump the version before publishing."
+}
+if ($LASTEXITCODE -ne 1) {
+    throw "Could not check whether local tag '$version' exists."
+}
+
+git ls-remote --exit-code --tags origin "refs/tags/$version" *> $null
+if ($LASTEXITCODE -eq 0) {
+    throw "Remote tag '$version' already exists. Version tags are immutable; bump the version before publishing."
+}
+if ($LASTEXITCODE -ne 2) {
+    throw "Could not check whether remote tag '$version' exists."
+}
+
 gh release view $version --repo $repoSlug *> $null
-if ($LASTEXITCODE -ne 0) {
-    $notes = @'
-Initial release.
-
-- Tiny progress bar under every markdown file in the file explorer
-- Fullness relative to a configurable target character count (default 3600)
-- Color shifts red -> yellow -> green with fullness; purple on overflow
-- Settings: target count, exclude frontmatter, bar thickness, overflow highlight
-- Install now via BRAT: add this repo as a beta plugin
-'@
-    $notesFile = New-TemporaryFile
-    Set-Content $notesFile $notes
-    # Tag and title must be the bare version number (no "v" prefix) per Obsidian's rules.
-    gh release create $version main.js manifest.json styles.css `
-        --repo $repoSlug --title $version --notes-file $notesFile
-    if ($LASTEXITCODE -ne 0) { throw "Release creation failed" }
-    Remove-Item $notesFile -Force
-    Write-Host "Release $version published - plugin is installable via BRAT right now." -ForegroundColor Green
-} else {
-    Write-Host "Release $version already exists - skipping." -ForegroundColor Yellow
+if ($LASTEXITCODE -eq 0) {
+    throw "GitHub release '$version' already exists. Bump the version before publishing."
 }
 
-# --- 4. Community directory submission (manual web form) --------------------
+# --- 1. Local build preflight -----------------------------------------------
+npm run build
+Assert-LastExitCode "Local build failed; no commits or tags were pushed."
+
+$postBuildChanges = @(git status --short --untracked-files=all)
+Assert-LastExitCode "Could not inspect the Git working tree after the build."
+if ($postBuildChanges.Count -gt 0) {
+    throw "The build changed tracked or untracked source files. Review them before publishing:`n$($postBuildChanges -join "`n")"
+}
+
+# --- 2. Push source and immutable version tag -------------------------------
+git push --set-upstream origin main
+Assert-LastExitCode "Could not push main; no release tag was created."
+
+git tag --annotate $version --message "Release $version" HEAD
+Assert-LastExitCode "Could not create annotated tag '$version'."
+
+git push origin "refs/tags/$version"
+Assert-LastExitCode "Could not push tag '$version'. Inspect local and remote tag state before retrying."
+
+Write-Host "Tag $version pushed. GitHub Actions will now build, attest, and publish the release." -ForegroundColor Cyan
+
+# --- 3. Wait for the release workflow and verify its assets -----------------
+$runId = $null
+for ($attempt = 0; $attempt -lt 30 -and -not $runId; $attempt++) {
+    $runOutput = gh run list `
+        --repo $repoSlug `
+        --workflow release.yml `
+        --event push `
+        --commit $localHead `
+        --limit 1 `
+        --json databaseId `
+        --jq '.[0].databaseId' 2>$null
+
+    if ($LASTEXITCODE -eq 0 -and $runOutput) {
+        $runId = [string] ($runOutput | Select-Object -First 1)
+    } else {
+        Start-Sleep -Seconds 2
+    }
+}
+
+$actionsUrl = "$($repo.url)/actions/workflows/release.yml"
+if (-not $runId) {
+    throw "Tag '$version' was pushed, but its release workflow was not found within 60 seconds. Check $actionsUrl"
+}
+
+gh run watch $runId --repo $repoSlug --exit-status
+Assert-LastExitCode "The release workflow failed. Inspect $actionsUrl and rerun the failed workflow after fixing it; do not move the tag."
+
+$releaseJson = gh release view $version --repo $repoSlug --json url,assets
+Assert-LastExitCode "The workflow succeeded, but release '$version' could not be read."
+$release = $releaseJson | ConvertFrom-Json
+$assetNames = @($release.assets | ForEach-Object { $_.name })
+foreach ($asset in @("main.js", "manifest.json", "styles.css")) {
+    if ($assetNames -notcontains $asset) {
+        throw "Release '$version' is missing required asset '$asset'. Inspect $($release.url)"
+    }
+}
+
+Write-Host "Release $version published with GitHub build-provenance attestations." -ForegroundColor Green
+Write-Host "  Release:      $($release.url)"
+Write-Host "  Attestations: $($repo.url)/attestations"
+Write-Host "  Verify:       gh attestation verify <downloaded-asset> --repo $repoSlug"
 Write-Host ""
-Write-Host "Everything the submission form requires is now published:" -ForegroundColor Green
-Write-Host "  - Public repo:            https://github.com/$repoSlug"
-Write-Host "  - Release $version with:  main.js, manifest.json, styles.css"
-Write-Host "  - README.md and LICENSE present, manifest id 'files-progress'"
-Write-Host ""
-Write-Host "Final step (browser, one time - Obsidian retired PR submissions):" -ForegroundColor Cyan
-Write-Host "  1. Sign in at https://community.obsidian.md with your Obsidian account"
-Write-Host "  2. Link your GitHub account ($login) to verify repo ownership"
-Write-Host "  3. Plugins -> New plugin -> enter https://github.com/$repoSlug"
-Write-Host "  4. Accept the developer policies and Submit"
-Write-Host ""
-Write-Host "Until approval, users can already install via BRAT with: $repoSlug"
-Start-Process "https://community.obsidian.md"
+Write-Host "For the one-time Obsidian directory submission, visit https://community.obsidian.md" -ForegroundColor Cyan
+Write-Host "Until approval, users can install via BRAT with: $repoSlug"

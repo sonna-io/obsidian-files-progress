@@ -1,0 +1,96 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+  artifact-metadata: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build, attest, and release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Validate release metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node <<'NODE'
+          const fs = require("node:fs");
+
+          const tag = process.env.RELEASE_TAG;
+          const manifest = JSON.parse(fs.readFileSync("manifest.json", "utf8"));
+          const packageJson = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          const versions = JSON.parse(fs.readFileSync("versions.json", "utf8"));
+          const semver = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+          if (!tag || !semver.test(tag)) {
+            throw new Error(`Release tag must be a bare semantic version; received ${JSON.stringify(tag)}`);
+          }
+          if (manifest.version !== tag) {
+            throw new Error(`manifest.json version ${manifest.version} does not match tag ${tag}`);
+          }
+          if (packageJson.version !== tag) {
+            throw new Error(`package.json version ${packageJson.version} does not match tag ${tag}`);
+          }
+          if (versions[tag] !== manifest.minAppVersion) {
+            throw new Error(
+              `versions.json must map ${tag} to minAppVersion ${manifest.minAppVersion}`,
+            );
+          }
+          NODE
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify and build release assets
+        run: npm run check
+
+      - name: Check release assets
+        run: |
+          test -s main.js
+          test -s styles.css
+          test -s manifest.json
+
+      - name: Attest release assets
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            main.js
+            styles.css
+            manifest.json
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            main.js \
+            manifest.json \
+            styles.css \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes \
+            --verify-tag
