@@ -103,6 +103,27 @@
 	color: var(--text-muted);
 	font-size: var(--font-ui-smaller);
 	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.ofp-row-menu {
+	flex: 0 0 auto;
+	width: var(--icon-size, 18px);
+	height: var(--icon-size, 18px);
+	padding: 1px;
+	opacity: 0;
+}
+
+.ofp-row:hover .ofp-row-menu,
+.ofp-row:focus-within .ofp-row-menu,
+.ofp-row-menu:focus-visible {
+	opacity: 1;
+}
+
+@media (hover: none) {
+	.ofp-row-menu {
+		opacity: 1;
+	}
 }
 
 .ofp-row-path {

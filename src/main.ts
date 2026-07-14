@@ -1,13 +1,25 @@
-import { Modal, Plugin, Setting, TFile, TFolder } from "obsidian";
+import {
+	Modal,
+	Notice,
+	Plugin,
+	Setting,
+	TFile,
+	TFolder,
+} from "obsidian";
 import {
 	BUILT_IN_PALETTES,
+	Completion,
 	DEFAULT_SETTINGS,
 	FilesProgressSettings,
 	FolderRule,
 	Palette,
+	formatManualPercent,
 	isDarkTheme,
+	normalizeSettings,
 	paletteColor,
+	parseManualProgress,
 	parentPath,
+	resolveCompletion,
 	resolveColors,
 } from "./types";
 import { FilesProgressSettingTab } from "./settings-tab";
@@ -30,6 +42,10 @@ interface FolderAggregate {
 }
 
 const FRONTMATTER_RE = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
 
 export default class FilesProgressPlugin extends Plugin {
 	settings: FilesProgressSettings = DEFAULT_SETTINGS;
@@ -56,7 +72,7 @@ export default class FilesProgressPlugin extends Plugin {
 
 		// Fires on every content change of a markdown file and hands us the new
 		// content, so no extra disk read is needed. Frontmatter edits also land
-		// here, which keeps scope/target/palette properties live.
+		// here, which keeps scope/manual/target/palette properties live.
 		this.registerEvent(
 			this.app.metadataCache.on("changed", (file, data) => {
 				this.counts.set(file.path, this.countChars(data));
@@ -115,9 +131,9 @@ export default class FilesProgressPlugin extends Plugin {
 		this.registerEvent(this.app.workspace.on("file-open", () => this.updateStatusBar()));
 
 		this.registerEvent(
-			this.app.workspace.on("file-menu", (menu, file) => {
+			this.app.workspace.on("file-menu", (menu, file, source) => {
 				if (file instanceof TFolder && file.path !== "/") {
-					menu.addSeparator();
+					if (source !== VIEW_TYPE_PROGRESS) menu.addSeparator();
 					menu.addItem((item) =>
 						item
 							.setTitle("Progress settings…")
@@ -144,6 +160,13 @@ export default class FilesProgressPlugin extends Plugin {
 							})
 					);
 				} else if (file instanceof TFile && file.extension === "md") {
+					if (source !== VIEW_TYPE_PROGRESS) menu.addSeparator();
+					menu.addItem((item) =>
+						item
+							.setTitle("Progress settings…")
+							.setIcon("gauge")
+							.onClick(() => new FileProgressModal(this, file).open())
+					);
 					const included = this.isIncluded(file.path);
 					menu.addItem((item) =>
 						item
@@ -184,49 +207,19 @@ export default class FilesProgressPlugin extends Plugin {
 
 	onunload() {
 		for (const { observer } of this.observers) observer.disconnect();
-		this.observers = [];
-		document.body.style.removeProperty("--ofp-thickness");
-		for (const bar of Array.from(document.querySelectorAll(".ofp-bar"))) bar.remove();
-		for (const host of Array.from(document.querySelectorAll(".ofp-host"))) {
-			host.removeClass("ofp-host");
+		for (const doc of this.pluginDocuments()) {
+			doc.body.style.removeProperty("--ofp-thickness");
+			for (const bar of Array.from(doc.querySelectorAll(".ofp-bar"))) bar.remove();
+			for (const host of Array.from(doc.querySelectorAll(".ofp-host"))) {
+				host.removeClass("ofp-host");
+			}
 		}
+		this.observers = [];
 	}
 
 	async loadSettings() {
-		const data = ((await this.loadData()) ?? {}) as Record<string, unknown>;
-		// 1.1.x stored per-folder targets in `folderTargets`; fold into folder rules.
-		if (Array.isArray(data.folderTargets) && !Array.isArray(data.folderRules)) {
-			data.folderRules = (data.folderTargets as { path: string; target: number }[]).map(
-				(t) => ({ path: t.path, target: t.target })
-			);
-			delete data.folderTargets;
-		}
-		// 1.2.x palettes stored flat colors; wrap them as the light variant.
-		if (Array.isArray(data.palettes)) {
-			data.palettes = (data.palettes as any[]).map((p: any) =>
-				p && typeof p === "object" && "light" in p
-					? p
-					: {
-							name: p.name,
-							light: {
-								start: p.start,
-								mid: p.mid,
-								end: p.end,
-								overflow: p.overflow,
-								track: "",
-							},
-					  }
-			);
-		}
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, data);
-		// Clone palettes so edits never mutate the built-in constants.
-		this.settings.palettes = (
-			this.settings.palettes.length ? this.settings.palettes : BUILT_IN_PALETTES
-		).map((p) => ({
-			name: p.name,
-			light: { ...p.light, track: p.light.track ?? "" },
-			dark: p.dark ? { ...p.dark, track: p.dark.track ?? "" } : undefined,
-		}));
+		const data: unknown = await this.loadData();
+		this.settings = normalizeSettings(data);
 	}
 
 	async saveSettings() {
@@ -234,7 +227,17 @@ export default class FilesProgressPlugin extends Plugin {
 	}
 
 	applyBarThickness() {
-		document.body.style.setProperty("--ofp-thickness", `${this.settings.barThickness}px`);
+		for (const doc of this.pluginDocuments()) {
+			doc.body.style.setProperty("--ofp-thickness", `${this.settings.barThickness}px`);
+		}
+	}
+
+	private pluginDocuments(): Set<Document> {
+		const documents = new Set([activeDocument, ...this.observers.map(({ el }) => el.doc)]);
+		for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_PROGRESS)) {
+			if (leaf.view instanceof ProgressView) documents.add(leaf.view.contentEl.doc);
+		}
+		return documents;
 	}
 
 	/** Re-apply everything after a settings change. */
@@ -253,6 +256,31 @@ export default class FilesProgressPlugin extends Plugin {
 		return path === folder || path.startsWith(folder + "/");
 	}
 
+	frontmatterValue(path: string, property: string): unknown {
+		const key = property.trim();
+		if (!key) return undefined;
+		const frontmatter: unknown = this.app.metadataCache.getCache(path)?.frontmatter;
+		return isRecord(frontmatter) ? frontmatter[key] : undefined;
+	}
+
+	frontmatterPropertyConflict(): string | undefined {
+		const entries = [
+			["Scope", this.settings.scopeProperty],
+			["Manual progress", this.settings.manualProgressProperty],
+			["Target", this.settings.targetProperty],
+			["Palette", this.settings.paletteProperty],
+		] as const;
+		const owners = new Map<string, string>();
+		for (const [label, rawKey] of entries) {
+			const key = rawKey.trim();
+			if (!key) continue;
+			const owner = owners.get(key);
+			if (owner) return `${owner} and ${label.toLowerCase()} use the same property (${key}).`;
+			owners.set(key, label);
+		}
+		return undefined;
+	}
+
 	/**
 	 * Scope precedence, most specific first:
 	 * excluded files > included files > frontmatter scope property >
@@ -264,7 +292,7 @@ export default class FilesProgressPlugin extends Plugin {
 		if (s.includedFiles.some((f) => f.trim() === path)) return true;
 		const scopeKey = s.scopeProperty.trim();
 		if (scopeKey) {
-			const value = this.app.metadataCache.getCache(path)?.frontmatter?.[scopeKey];
+			const value = this.frontmatterValue(path, scopeKey);
 			if (value !== undefined && value !== null) {
 				return !(value === false || value === "false" || value === "no" || value === 0);
 			}
@@ -324,7 +352,7 @@ export default class FilesProgressPlugin extends Plugin {
 	targetFor(filePath: string): number {
 		const key = this.settings.targetProperty.trim();
 		if (key) {
-			const raw = this.app.metadataCache.getCache(filePath)?.frontmatter?.[key];
+			const raw = this.frontmatterValue(filePath, key);
 			if (raw !== undefined && raw !== null) {
 				const parsed = Math.round(Number(raw));
 				if (Number.isFinite(parsed) && parsed > 0) return parsed;
@@ -340,6 +368,13 @@ export default class FilesProgressPlugin extends Plugin {
 			dir = parentPath(dir);
 		}
 		return this.settings.targetChars;
+	}
+
+	completionFor(filePath: string, count: number): Completion {
+		const target = this.targetFor(filePath);
+		const key = this.settings.manualProgressProperty.trim();
+		const manualValue = key ? this.frontmatterValue(filePath, key) : undefined;
+		return resolveCompletion(count, target, manualValue);
 	}
 
 	// ---------- palettes ----------
@@ -361,7 +396,7 @@ export default class FilesProgressPlugin extends Plugin {
 	paletteFor(filePath: string): Palette {
 		const key = this.settings.paletteProperty.trim();
 		if (key) {
-			const raw = this.app.metadataCache.getCache(filePath)?.frontmatter?.[key];
+			const raw = this.frontmatterValue(filePath, key);
 			const palette = this.findPalette(raw);
 			if (palette) return palette;
 		}
@@ -435,9 +470,17 @@ export default class FilesProgressPlugin extends Plugin {
 			el.hide();
 			return;
 		}
-		const target = this.targetFor(file.path);
-		const pct = target > 0 ? Math.round((count / target) * 100) : 0;
-		el.setText(`${count.toLocaleString()} / ${target.toLocaleString()} · ${pct}%`);
+		const completion = this.completionFor(file.path, count);
+		const pct =
+			completion.manualPercent !== undefined
+				? formatManualPercent(completion.manualPercent)
+				: String(Math.round(completion.ratio * 100));
+		const source = completion.manualPercent !== undefined ? `${pct}% manual · ` : "";
+		el.setText(
+			completion.manualPercent !== undefined
+				? `${source}${count.toLocaleString()} / ${completion.target.toLocaleString()}`
+				: `${count.toLocaleString()} / ${completion.target.toLocaleString()} · ${pct}%`
+		);
 		el.show();
 	}
 
@@ -474,13 +517,14 @@ export default class FilesProgressPlugin extends Plugin {
 		for (const view of this.explorerViews()) {
 			const el = view.containerEl;
 			if (!el || this.observers.some((entry) => entry.el === el)) continue;
+			el.doc.body.style.setProperty("--ofp-thickness", `${this.settings.barThickness}px`);
 			const observer = new MutationObserver((mutations) => {
 				// Re-decorate when the explorer renders new rows (folder expand,
 				// new files, sort changes) — but ignore our own bar insertions.
 				for (const mutation of mutations) {
 					for (const node of Array.from(mutation.addedNodes)) {
 						if (
-							node instanceof HTMLElement &&
+							node.instanceOf(HTMLElement) &&
 							!node.hasClass("ofp-bar") &&
 							!node.hasClass("ofp-fill")
 						) {
@@ -499,7 +543,7 @@ export default class FilesProgressPlugin extends Plugin {
 	scheduleRefresh() {
 		if (this.refreshQueued) return;
 		this.refreshQueued = true;
-		requestAnimationFrame(() => {
+		window.requestAnimationFrame(() => {
 			this.refreshQueued = false;
 			this.refreshAll();
 		});
@@ -512,8 +556,7 @@ export default class FilesProgressPlugin extends Plugin {
 			if (!this.isIncluded(file.path)) continue;
 			const count = this.counts.get(file.path);
 			if (count === undefined) continue;
-			const target = this.targetFor(file.path);
-			const ratio = target > 0 ? Math.min(1, count / target) : 0;
+			const ratio = Math.min(1, this.completionFor(file.path, count).ratio);
 			let dir = parentPath(file.path);
 			while (dir) {
 				const entry = agg.get(dir) ?? { sum: 0, n: 0 };
@@ -529,7 +572,8 @@ export default class FilesProgressPlugin extends Plugin {
 	private refreshAll() {
 		const folderAgg = this.settings.showFolderBars ? this.folderAggregates() : null;
 		for (const view of this.explorerViews()) {
-			const items = view.fileItems as Record<string, FileExplorerItem>;
+			const items = view.fileItems;
+			if (!items) continue;
 			for (const path in items) {
 				this.decorate(items[path], path, folderAgg);
 			}
@@ -578,19 +622,19 @@ export default class FilesProgressPlugin extends Plugin {
 			if (file instanceof TFile) void this.readCount(file);
 		}
 
-		const target = this.targetFor(path);
-		const ratio = count !== undefined && target > 0 ? count / target : 0;
+		const ratio = count !== undefined ? this.completionFor(path, count).ratio : 0;
 		this.applyBar(el, ratio, false, this.paletteFor(path));
 	}
 
 	private applyBar(el: HTMLElement, ratio: number, isFolder: boolean, palette: Palette) {
 		el.addClass("ofp-host");
-		let bar = el.querySelector(":scope > .ofp-bar") as HTMLElement | null;
+		let bar = el.querySelector<HTMLElement>(":scope > .ofp-bar");
 		if (!bar) {
 			bar = el.createDiv({ cls: "ofp-bar" });
-			bar.createDiv({ cls: "ofp-fill" });
 		}
-		const fill = bar.firstElementChild as HTMLElement;
+		const fill =
+			bar.querySelector<HTMLElement>(":scope > .ofp-fill") ??
+			bar.createDiv({ cls: "ofp-fill" });
 
 		const highlightOverflow = this.settings.highlightOverflow && !isFolder;
 		const overflow = ratio > 1 && highlightOverflow;
@@ -600,7 +644,7 @@ export default class FilesProgressPlugin extends Plugin {
 		if (ratio > 0 && widthPct < 3) widthPct = 3;
 
 		const width = `${widthPct.toFixed(1)}%`;
-		const colors = resolveColors(palette, isDarkTheme());
+		const colors = resolveColors(palette, isDarkTheme(el.doc));
 		const color = paletteColor(colors, ratio, highlightOverflow);
 		const track = colors.track.trim();
 
@@ -624,6 +668,188 @@ export default class FilesProgressPlugin extends Plugin {
 	private removeBar(el: HTMLElement) {
 		el.querySelector(":scope > .ofp-bar")?.remove();
 		el.removeClass("ofp-host");
+	}
+}
+
+function editableFrontmatterText(value: unknown): string {
+	return typeof value === "string" || typeof value === "number" ? String(value) : "";
+}
+
+/** Modal opened from a note context menu: frontmatter-backed note overrides. */
+export class FileProgressModal extends Modal {
+	constructor(private plugin: FilesProgressPlugin, private file: TFile) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.setTitle(`Progress settings — ${this.file.basename}`);
+		const settings = this.plugin.settings;
+		const manualKey = settings.manualProgressProperty.trim();
+		const targetKey = settings.targetProperty.trim();
+		const paletteKey = settings.paletteProperty.trim();
+		const manualRaw = this.plugin.frontmatterValue(this.file.path, manualKey);
+		const targetRaw = this.plugin.frontmatterValue(this.file.path, targetKey);
+		const paletteRaw = this.plugin.frontmatterValue(this.file.path, paletteKey);
+		let manualValue = editableFrontmatterText(manualRaw);
+		let targetValue = editableFrontmatterText(targetRaw);
+		let paletteValue = typeof paletteRaw === "string" ? paletteRaw : "";
+
+		new Setting(this.contentEl)
+			.setName("Manual progress")
+			.setDesc(
+				manualKey
+					? `Percentage from 1 through 100; decimals are supported. Leave empty to calculate from characters (${manualKey}).`
+					: "Set a manual progress property in the plugin settings before adding an override."
+			)
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "100";
+				text.inputEl.step = "any";
+				text
+					.setPlaceholder("Automatic")
+					.setValue(manualValue)
+					.onChange((value) => (manualValue = value));
+			});
+
+		new Setting(this.contentEl)
+			.setName("Target character count")
+			.setDesc(
+				targetKey
+					? `Leave empty to inherit ${this.plugin
+							.targetForFolder(parentPath(this.file.path))
+							.toLocaleString()} characters (${targetKey}).`
+					: "Set a target property in the plugin settings before adding an override."
+			)
+			.addText((text) => {
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.step = "1";
+				text
+					.setPlaceholder("Inherit")
+					.setValue(targetValue)
+					.onChange((value) => (targetValue = value));
+			});
+
+		new Setting(this.contentEl)
+			.setName("Color palette")
+			.setDesc(
+				paletteKey
+					? `Leave on “Inherit” to use ${this.plugin.paletteForFolder(parentPath(this.file.path)).name} (${paletteKey}).`
+					: "Set a palette property in the plugin settings before adding an override."
+			)
+			.addDropdown((dropdown) => {
+				dropdown.addOption("", "Inherit");
+				for (const palette of settings.palettes) dropdown.addOption(palette.name, palette.name);
+				if (
+					paletteValue &&
+					!settings.palettes.some((palette) => palette.name === paletteValue)
+				) {
+					dropdown.addOption(paletteValue, `${paletteValue} (missing)`);
+				}
+				dropdown.setValue(paletteValue).onChange((value) => (paletteValue = value));
+			});
+
+		const buttons = new Setting(this.contentEl);
+		buttons.addButton((button) =>
+			button
+				.setButtonText("Save")
+				.setCta()
+				.onClick(() => void this.saveOverrides(manualValue, targetValue, paletteValue))
+		);
+		if (manualRaw !== undefined || targetRaw !== undefined || paletteRaw !== undefined) {
+			buttons.addButton((button) =>
+				button
+					.setButtonText("Clear overrides")
+					.setDestructive()
+					.onClick(() => void this.clearOverrides())
+			);
+		}
+	}
+
+	private propertyKeys(): { manual: string; target: string; palette: string } {
+		return {
+			manual: this.plugin.settings.manualProgressProperty.trim(),
+			target: this.plugin.settings.targetProperty.trim(),
+			palette: this.plugin.settings.paletteProperty.trim(),
+		};
+	}
+
+	private validatePropertyKeys(): boolean {
+		const conflict = this.plugin.frontmatterPropertyConflict();
+		if (!conflict) return true;
+		new Notice(`Files Progress: ${conflict} Give each frontmatter setting a unique property.`);
+		return false;
+	}
+
+	private async saveOverrides(manualText: string, targetText: string, palette: string) {
+		if (!this.validatePropertyKeys()) return;
+		const keys = this.propertyKeys();
+		const manual = manualText.trim() === "" ? undefined : parseManualProgress(manualText);
+		if (manualText.trim() !== "" && manual === undefined) {
+			new Notice("Manual progress must be a number from 1 through 100.");
+			return;
+		}
+		const targetNumber = Number(targetText);
+		const roundedTarget = Math.round(targetNumber);
+		const target =
+			targetText.trim() !== "" && Number.isFinite(targetNumber) && roundedTarget > 0
+				? roundedTarget
+				: undefined;
+		if (targetText.trim() !== "" && target === undefined) {
+			new Notice("Target character count must be a positive number.");
+			return;
+		}
+		if ((manual !== undefined && !keys.manual) || (target !== undefined && !keys.target) || (palette && !keys.palette)) {
+			new Notice("Configure the corresponding frontmatter property before saving an override.");
+			return;
+		}
+
+		try {
+			await this.plugin.app.fileManager.processFrontMatter(
+				this.file,
+				(frontmatter: Record<string, unknown>) => {
+					this.setOrDelete(frontmatter, keys.manual, manual);
+					this.setOrDelete(frontmatter, keys.target, target);
+					this.setOrDelete(frontmatter, keys.palette, palette || undefined);
+				}
+			);
+			this.close();
+		} catch {
+			new Notice("Files progress could not update this note's frontmatter.");
+		}
+	}
+
+	private async clearOverrides() {
+		if (!this.validatePropertyKeys()) return;
+		const keys = this.propertyKeys();
+		try {
+			await this.plugin.app.fileManager.processFrontMatter(
+				this.file,
+				(frontmatter: Record<string, unknown>) => {
+					for (const key of Object.values(keys)) {
+						if (key) delete frontmatter[key];
+					}
+				}
+			);
+			this.close();
+		} catch {
+			new Notice("Files progress could not clear this note's frontmatter overrides.");
+		}
+	}
+
+	private setOrDelete(
+		frontmatter: Record<string, unknown>,
+		key: string,
+		value: string | number | undefined
+	) {
+		if (!key) return;
+		if (value === undefined) delete frontmatter[key];
+		else frontmatter[key] = value;
+	}
+
+	onClose() {
+		this.contentEl.empty();
 	}
 }
 
@@ -691,7 +917,7 @@ export class FolderRuleModal extends Modal {
 			buttons.addButton((button) =>
 				button
 					.setButtonText("Remove override")
-					.setWarning()
+					.setDestructive()
 					.onClick(async () => {
 						this.plugin.settings.folderRules = this.plugin.settings.folderRules.filter(
 							(r) => r.path !== this.folderPath

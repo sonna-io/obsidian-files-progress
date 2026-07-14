@@ -7,10 +7,10 @@ An Obsidian plugin that enhances the file explorer with the tiniest possible hor
 - **Tiny, seamless bars** — a 2px (configurable 1–4px) bar rendered inside Obsidian's native file explorer rows, aligned with the file name indentation, using theme variables so it blends with any theme.
 - **Fullness by character count** — a note is 100% full at the target character count (default **3600**, configurable globally, per folder, and per note via frontmatter).
 - **Custom color palettes** — palettes define the colors at 0%, 50%, 100%, past the target, and the **gauge background** (empty part), blended smoothly in between. The background defaults to Obsidian's theme-aware track color. Each palette can carry an optional **dark-mode variant**, picked automatically from Obsidian's appearance setting (light/dark/adapt-to-system). Three presets ship (Default red→yellow→green, Ocean, Violet); create, edit, and delete palettes with color pickers. Assign a default palette, per-folder palettes, or a per-note palette via frontmatter.
-- **Progress view** — a sidebar view listing every note in scope with its completion. Sort by completion, name, folder path, character count, or recent modification; group by folder (collapsible, with per-folder averages); see vault-wide stats (average completion, notes at/over target). Click a row to open the note. The gauges follow the thickness and palette settings.
+- **Progress view** — a sidebar view listing every note in scope with its completion. Sort by completion, name, folder path, character count, or recent modification; group by folder (collapsible, with per-folder averages); see vault-wide stats (average completion, notes at/over target). Click a row to open the note, or right-click/use its `…` button to open it in a new tab, apply per-note progress settings, change its scope, or use file actions contributed by other plugins. Folder headers expose their progress actions too. The gauges follow the thickness and palette settings.
 - **VS Code-style filtering** — the view's filter box supports comma-separated terms, `*`/`?`/`**` globs (matched against the path or file name), `!term` exclusions, and the familiar toggle trio: match case, whole word, and regular expression.
 - **Folder & file scoping** — include only specific folders, exclude folders, and force-include or force-exclude individual notes. Togglable from the context menu of any folder or note, or with the "Toggle progress bar for active note" command. Scope lists follow file renames automatically.
-- **Frontmatter control** — three configurable properties: `progress` (include/exclude a note: any value includes, `false`/`no` excludes — overrides folder scope), `progress-target` (per-note target character count), and `progress-palette` (per-note palette by name).
+- **Frontmatter control** — four configurable properties: `progress` (include/exclude a note: any value includes, `false`/`no` excludes — overrides folder scope), `progress-percent` (manual completion from 1 through 100, including decimals), `progress-target` (per-note target character count), and `progress-palette` (per-note palette by name). A valid manual percentage overrides character-based completion everywhere; an invalid value safely falls back to the calculated value.
 - **Per-folder overrides** — give any folder its own target and/or palette; the nearest ancestor override wins. Configurable in settings or from the folder context menu ("Progress settings…").
 - **Folder progress bars** *(optional)* — folders show an aggregate bar with the average completion of the notes inside.
 - **Status bar** — the active note's `characters / target · %` at a glance; click it to open the progress view.
@@ -32,14 +32,19 @@ An Obsidian plugin that enhances the file explorer with the tiniest possible hor
 | Included / excluded folders | — | Folder-level scope |
 | Included / excluded files | — | Note-level scope (strongest) |
 | Scope property | `progress` | Frontmatter include/exclude keyword |
+| Manual progress property | `progress-percent` | Frontmatter completion override from 1 through 100; decimals supported |
 | Target property | `progress-target` | Frontmatter per-note target |
 | Palette property | `progress-palette` | Frontmatter per-note palette |
 | Folder overrides | — | Per-folder target and/or palette |
 
 **Scope precedence** (most specific wins): excluded files → included files → frontmatter scope property → excluded folders → included folders → everything in.
-**Target precedence**: frontmatter → nearest folder override → global default. **Palette precedence**: frontmatter → nearest folder override → default palette.
+**Completion precedence**: valid manual percentage → characters / effective target. **Target precedence**: frontmatter → nearest folder override → global default. **Palette precedence**: frontmatter → nearest folder override → default palette.
 
 Commands: `Recalculate all progress bars`, `Open progress view` (also via the ribbon gauge icon), `Toggle progress bar for active note`.
+
+## Privacy and vault access
+
+Files Progress enumerates Markdown files in the vault and reads their contents locally to calculate progress. It does not access non-Markdown file contents, send vault data over the network, include telemetry, or use external services.
 
 ## Installation
 
@@ -65,6 +70,23 @@ Once approved by the Obsidian team, the plugin will be installable directly from
 npm install
 npm run dev    # watch mode
 npm run build  # type-check + production bundle
+npm run check  # official Obsidian lint + tests + production build
 ```
 
 Copy `main.js`, `manifest.json`, and `styles.css` into `<vault>/.obsidian/plugins/files-progress/`.
+
+### Releasing
+
+Update the version in `manifest.json`, `package.json`, and `versions.json`, then commit the release on a clean `main` branch. Run:
+
+```powershell
+.\publish.ps1
+```
+
+The script performs a local build preflight and pushes an annotated, bare version tag such as `1.4.0`. The tag-triggered GitHub Actions workflow installs from `package-lock.json`, rebuilds the plugin, creates GitHub build-provenance attestations for `main.js`, `manifest.json`, and `styles.css`, and publishes those exact files as the GitHub release. Do not create or upload release assets manually.
+
+After downloading a release asset, its provenance can be checked with:
+
+```bash
+gh attestation verify main.js --repo sonna-io/obsidian-files-progress
+```

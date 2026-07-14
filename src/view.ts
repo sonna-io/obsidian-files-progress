@@ -1,6 +1,13 @@
-import { ItemView, Keymap, TFile, WorkspaceLeaf, setIcon } from "obsidian";
+import { ItemView, Keymap, Menu, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
 import type FilesProgressPlugin from "./main";
-import { ViewSort, isDarkTheme, paletteColor, parentPath, resolveColors } from "./types";
+import {
+	ViewSort,
+	formatManualPercent,
+	isDarkTheme,
+	paletteColor,
+	parentPath,
+	resolveColors,
+} from "./types";
 
 export const VIEW_TYPE_PROGRESS = "files-progress-view";
 
@@ -18,6 +25,7 @@ interface Row {
 	count: number;
 	target: number;
 	ratio: number;
+	manualPercent?: number;
 }
 
 interface PathFilter {
@@ -119,6 +127,7 @@ export class ProgressView extends ItemView {
 
 	async onOpen() {
 		const el = this.contentEl;
+		this.register(el.onWindowMigrated(() => this.plugin.applyBarThickness()));
 		el.empty();
 		el.addClass("ofp-view");
 
@@ -162,9 +171,9 @@ export class ProgressView extends ItemView {
 			cls: "ofp-search",
 			attr: {
 				type: "search",
-				placeholder: "Filter (e.g. daily*, !archive)",
+				placeholder: "Filter (e.g. Daily*, !archive)",
 				"aria-label":
-					"Comma-separated terms. Plain terms match anywhere in the path; * ? ** are globs; !term excludes.",
+					"Filter paths with comma-separated terms, globs (*, ?, or **), and !term exclusions.",
 			},
 		});
 		search.value = this.query;
@@ -202,12 +211,12 @@ export class ProgressView extends ItemView {
 	}
 
 	async onClose() {
-		if (this.renderTimer !== null) window.clearTimeout(this.renderTimer);
+		if (this.renderTimer !== null) this.contentEl.win.clearTimeout(this.renderTimer);
 	}
 
 	requestRender() {
 		if (this.renderTimer !== null) return;
-		this.renderTimer = window.setTimeout(() => {
+		this.renderTimer = this.contentEl.win.setTimeout(() => {
 			this.renderTimer = null;
 			this.renderList();
 		}, 250);
@@ -220,8 +229,8 @@ export class ProgressView extends ItemView {
 			if (!filter.test(file.path)) continue;
 			const count = this.plugin.counts.get(file.path);
 			if (count === undefined) continue;
-			const target = this.plugin.targetFor(file.path);
-			rows.push({ file, count, target, ratio: target > 0 ? count / target : 0 });
+			const completion = this.plugin.completionFor(file.path, count);
+			rows.push({ file, count, ...completion });
 		}
 		return rows;
 	}
@@ -315,27 +324,52 @@ export class ProgressView extends ItemView {
 			header.toggleClass("is-collapsed", this.collapsedGroups.has(key));
 			body.toggle(this.collapsedGroups.has(key) === false);
 		};
+		if (key !== "/") {
+			header.addEventListener("contextmenu", (event) => {
+				const folder = this.plugin.app.vault.getAbstractFileByPath(key);
+				if (!(folder instanceof TFolder)) return;
+				event.preventDefault();
+				event.stopPropagation();
+				this.showFileMenu(folder, event);
+			});
+		}
 	}
 
 	private renderRow(container: HTMLElement, row: Row, showPath: boolean) {
-		const pct = Math.round(row.ratio * 100);
+		const pct =
+			row.manualPercent !== undefined
+				? formatManualPercent(row.manualPercent)
+				: String(Math.round(row.ratio * 100));
 		const rowEl = container.createDiv({ cls: "ofp-row" });
 		rowEl.setAttr(
 			"aria-label",
-			`${row.count.toLocaleString()} / ${row.target.toLocaleString()} characters`
+			row.manualPercent !== undefined
+				? `${pct}% manual · ${row.count.toLocaleString()} / ${row.target.toLocaleString()} characters`
+				: `${row.count.toLocaleString()} / ${row.target.toLocaleString()} characters`
 		);
 		rowEl.setAttr("data-tooltip-position", "top");
 
 		const top = rowEl.createDiv({ cls: "ofp-row-top" });
 		top.createSpan({ cls: "ofp-row-name", text: row.file.basename });
-		top.createSpan({ cls: "ofp-row-pct", text: `${pct}%` });
+		top.createSpan({ cls: "ofp-row-pct", text: `${pct}%${row.manualPercent !== undefined ? " · manual" : ""}` });
+		const menuButton = top.createEl("button", {
+			cls: "clickable-icon ofp-row-menu",
+			attr: { "aria-label": `More options for ${row.file.basename}` },
+		});
+		setIcon(menuButton, "more-horizontal");
+		menuButton.addEventListener("click", (event) => {
+			event.preventDefault();
+			event.stopPropagation();
+			const rect = menuButton.getBoundingClientRect();
+			this.showFileMenuAt(row.file, rect.right, rect.bottom, menuButton.doc);
+		});
 
 		if (showPath) {
 			const dir = parentPath(row.file.path);
 			if (dir) rowEl.createDiv({ cls: "ofp-row-path", text: dir });
 		}
 
-		const colors = resolveColors(this.plugin.paletteFor(row.file.path), isDarkTheme());
+		const colors = resolveColors(this.plugin.paletteFor(row.file.path), isDarkTheme(rowEl.doc));
 		const track = rowEl.createDiv({ cls: "ofp-row-track" });
 		if (colors.track.trim()) track.style.backgroundColor = colors.track;
 		const fill = track.createDiv({ cls: "ofp-row-fill" });
@@ -351,5 +385,39 @@ export class ProgressView extends ItemView {
 		rowEl.addEventListener("click", (evt) => {
 			void this.plugin.app.workspace.getLeaf(Keymap.isModEvent(evt)).openFile(row.file);
 		});
+		rowEl.addEventListener("contextmenu", (event) => {
+			event.preventDefault();
+			event.stopPropagation();
+			this.showFileMenu(row.file, event);
+		});
+	}
+
+	private createFileMenu(file: TFile | TFolder): Menu {
+		const menu = new Menu();
+		if (file instanceof TFile) {
+			menu.addItem((item) =>
+				item
+					.setTitle("Open")
+					.setIcon("file")
+					.onClick(() => void this.leaf.openFile(file))
+			);
+			menu.addItem((item) =>
+				item
+					.setTitle("Open in new tab")
+					.setIcon("files")
+					.onClick(() => void this.plugin.app.workspace.getLeaf("tab").openFile(file))
+			);
+			menu.addSeparator();
+		}
+		this.plugin.app.workspace.trigger("file-menu", menu, file, VIEW_TYPE_PROGRESS, this.leaf);
+		return menu;
+	}
+
+	private showFileMenu(file: TFile | TFolder, event: MouseEvent) {
+		this.createFileMenu(file).showAtMouseEvent(event);
+	}
+
+	private showFileMenuAt(file: TFile, x: number, y: number, doc: Document) {
+		this.createFileMenu(file).showAtPosition({ x, y }, doc);
 	}
 }
