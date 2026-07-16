@@ -25,11 +25,18 @@ The bars are intentionally tiny. They add useful context while keeping Obsidian'
 
 ## Installation
 
-Files Progress is currently distributed through BRAT while its Community directory listing is pending.
+Files Progress is available from Obsidian's Community plugins browser.
+
+### Install from Obsidian
+
+1. Open **Settings → Community plugins** in Obsidian.
+2. Select **Browse**.
+3. Search for **Files Progress**.
+4. Select **Install**, then select **Enable**.
 
 ### Install with BRAT
 
-BRAT is a community plugin that installs beta plugins from GitHub and keeps them updated. Obsidian's developer documentation recommends it for beta testing.
+BRAT can install beta or pre-release versions directly from GitHub. Most users should use the Community plugins browser instead.
 
 1. Open **Settings → Community plugins** in Obsidian.
 2. Select **Browse**, search for **BRAT**, then install and enable it.
@@ -52,11 +59,9 @@ Manual installation is intended for advanced users:
 
 Files Progress requires Obsidian 1.5.7 or newer.
 
-### Community directory availability
+### Community directory updates
 
-A GitHub release does not automatically place a plugin in Obsidian's Community plugins browser.
-
-The plugin must first complete Obsidian's [Community directory submission and review](https://docs.obsidian.md/Plugins/Releasing/Submit%20your%20plugin). After approval, future updates will be available directly in Obsidian.
+Files Progress has completed its initial Community directory submission. New stable releases are delivered as normal in-app updates after their verified GitHub release is available.
 
 ## Getting started
 
