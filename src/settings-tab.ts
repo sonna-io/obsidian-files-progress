@@ -3,18 +3,28 @@ import {
 	App,
 	Notice,
 	PluginSettingTab,
+	Setting,
 	TFile,
 	TFolder,
-} from "obsidian";
-import type {
-	Setting,
-	SettingDefinitionGroup,
-	SettingDefinitionItem,
-	SettingDefinitionRender,
 } from "obsidian";
 import type FilesProgressPlugin from "./main";
 import { DEFAULT_SETTINGS } from "./types";
 import type { Palette, PaletteColors } from "./types";
+
+interface SettingDefinitionRender {
+	name: string;
+	desc?: string;
+	searchable?: boolean;
+	render: (setting: Setting) => void;
+}
+
+interface SettingDefinitionGroup {
+	type: "group";
+	heading: string;
+	items: SettingDefinitionRender[];
+}
+
+type SettingDefinitionItem = SettingDefinitionRender | SettingDefinitionGroup;
 
 class FolderSuggest extends AbstractInputSuggest<TFolder> {
 	private textInputEl: HTMLInputElement;
@@ -79,6 +89,24 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 	constructor(app: App, plugin: FilesProgressPlugin) {
 		super(app, plugin);
 		this.plugin = plugin;
+	}
+
+	display() {
+		this.containerEl.empty();
+		for (const definition of this.getSettingDefinitions()) {
+			if ("type" in definition) {
+				new Setting(this.containerEl).setName(definition.heading).setHeading();
+				for (const item of definition.items) this.displayDefinition(item);
+			} else {
+				this.displayDefinition(definition);
+			}
+		}
+	}
+
+	private displayDefinition(definition: SettingDefinitionRender) {
+		const setting = new Setting(this.containerEl).setName(definition.name);
+		if (definition.desc) setting.setDesc(definition.desc);
+		definition.render(setting);
 	}
 
 	getSettingDefinitions(): SettingDefinitionItem[] {
@@ -245,7 +273,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 								},
 							});
 							await this.plugin.saveSettings();
-							this.update();
+							this.display();
 						})
 					);
 				}
@@ -340,7 +368,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 					colors.track = "";
 					await this.plugin.saveSettings();
 					this.plugin.settingsChanged();
-					this.update();
+					this.display();
 				})
 		);
 
@@ -354,7 +382,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 							palette.dark = { ...palette.light };
 							await this.plugin.saveSettings();
 							this.plugin.settingsChanged();
-							this.update();
+							this.display();
 						})
 				);
 			}
@@ -374,7 +402,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						this.plugin.settings.palettes.splice(index, 1);
 						await this.plugin.saveSettings();
 						this.plugin.settingsChanged();
-						this.update();
+						this.display();
 					})
 			);
 		} else {
@@ -386,7 +414,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						delete palette.dark;
 						await this.plugin.saveSettings();
 						this.plugin.settingsChanged();
-						this.update();
+						this.display();
 					})
 			);
 		}
@@ -450,7 +478,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						.onClick(async () => {
 							list.push("");
 							await this.plugin.saveSettings();
-							this.update();
+							this.display();
 						})
 				);
 			}),
@@ -486,7 +514,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 								list.splice(index, 1);
 								await this.plugin.saveSettings();
 								this.plugin.settingsChanged();
-								this.update();
+								this.display();
 							})
 					);
 					return () => suggest?.close();
@@ -584,7 +612,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 						button.setButtonText("Add override").onClick(async () => {
 							this.plugin.settings.folderRules.push({ path: "" });
 							await this.plugin.saveSettings();
-							this.update();
+							this.display();
 						})
 					);
 				}
@@ -644,7 +672,7 @@ export class FilesProgressSettingTab extends PluginSettingTab {
 								this.plugin.settings.folderRules.splice(index, 1);
 								await this.plugin.saveSettings();
 								this.plugin.settingsChanged();
-								this.update();
+								this.display();
 							})
 					);
 					return () => suggest?.close();

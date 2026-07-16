@@ -84,6 +84,12 @@
 	background-color: var(--background-modifier-hover);
 }
 
+.ofp-row.is-selected,
+.ofp-group-header.is-selected {
+	background-color: var(--background-modifier-active-hover);
+	color: var(--text-normal);
+}
+
 .ofp-row-top {
 	display: flex;
 	align-items: baseline;

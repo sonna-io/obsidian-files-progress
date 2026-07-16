@@ -14,4 +14,10 @@ export default [
 			},
 		},
 	},
+	{
+		files: ["tests/**/*.ts"],
+		rules: {
+			"obsidianmd/no-nodejs-modules": "off",
+		},
+	},
 ];

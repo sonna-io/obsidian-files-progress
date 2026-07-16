@@ -1,11 +1,13 @@
 import {
 	Modal,
+	Menu,
 	Notice,
 	Plugin,
 	Setting,
 	TFile,
 	TFolder,
 } from "obsidian";
+import type { TAbstractFile } from "obsidian";
 import {
 	BUILT_IN_PALETTES,
 	Completion,
@@ -24,6 +26,16 @@ import {
 } from "./types";
 import { FilesProgressSettingTab } from "./settings-tab";
 import { ProgressView, VIEW_TYPE_PROGRESS } from "./view";
+import {
+	UNCHANGED_PATCH,
+	applyBulkProgressPatch,
+	progressMenuActions,
+} from "./progress-actions";
+import type {
+	BulkProgressPatch,
+	ProgressMenuAction,
+	ProgressSelectionItem,
+} from "./progress-actions";
 
 /** Minimal shape of the (undocumented) file explorer view internals we rely on. */
 interface FileExplorerItem {
@@ -56,7 +68,11 @@ export default class FilesProgressPlugin extends Plugin {
 	private refreshQueued = false;
 	private statusBarEl: HTMLElement | null = null;
 
-	async onload() {
+	onload() {
+		void this.initialize();
+	}
+
+	private async initialize() {
 		await this.loadSettings();
 		this.addSettingTab(new FilesProgressSettingTab(this.app, this));
 		this.applyBarThickness();
@@ -132,49 +148,12 @@ export default class FilesProgressPlugin extends Plugin {
 
 		this.registerEvent(
 			this.app.workspace.on("file-menu", (menu, file, source) => {
-				if (file instanceof TFolder && file.path !== "/") {
-					if (source !== VIEW_TYPE_PROGRESS) menu.addSeparator();
-					menu.addItem((item) =>
-						item
-							.setTitle("Progress settings…")
-							.setIcon("gauge")
-							.onClick(() => new FolderRuleModal(this, file.path).open())
-					);
-					const isExcluded = this.settings.excludedFolders.some(
-						(f) => f.trim() === file.path
-					);
-					menu.addItem((item) =>
-						item
-							.setTitle(isExcluded ? "Show progress bars" : "Hide progress bars")
-							.setIcon(isExcluded ? "eye" : "eye-off")
-							.onClick(async () => {
-								if (isExcluded) {
-									this.settings.excludedFolders = this.settings.excludedFolders.filter(
-										(f) => f.trim() !== file.path
-									);
-								} else {
-									this.settings.excludedFolders.push(file.path);
-								}
-								await this.saveSettings();
-								this.settingsChanged();
-							})
-					);
-				} else if (file instanceof TFile && file.extension === "md") {
-					if (source !== VIEW_TYPE_PROGRESS) menu.addSeparator();
-					menu.addItem((item) =>
-						item
-							.setTitle("Progress settings…")
-							.setIcon("gauge")
-							.onClick(() => new FileProgressModal(this, file).open())
-					);
-					const included = this.isIncluded(file.path);
-					menu.addItem((item) =>
-						item
-							.setTitle(included ? "Hide progress bar" : "Show progress bar")
-							.setIcon(included ? "eye-off" : "eye")
-							.onClick(() => void this.toggleFileScope(file.path))
-					);
-				}
+				this.addProgressMenuItems(menu, [file], source);
+			})
+		);
+		this.registerEvent(
+			this.app.workspace.on("files-menu", (menu, files, source) => {
+				this.addProgressMenuItems(menu, files, source);
 			})
 		);
 
@@ -246,6 +225,139 @@ export default class FilesProgressPlugin extends Plugin {
 		this.scheduleRefresh();
 		this.updateStatusBar();
 		this.notifyView();
+	}
+
+	private menuSelection(files: TAbstractFile[]): ProgressSelectionItem[] {
+		const seen = new Set<string>();
+		const selection: ProgressSelectionItem[] = [];
+		for (const file of files) {
+			const kind =
+				file instanceof TFile && file.extension === "md"
+					? "file"
+					: file instanceof TFolder && file.path !== "/"
+					? "folder"
+					: undefined;
+			if (!kind || seen.has(file.path)) continue;
+			seen.add(file.path);
+			selection.push({ kind, path: file.path });
+		}
+		return selection;
+	}
+
+	private addProgressMenuItems(menu: Menu, files: TAbstractFile[], source: string) {
+		const selection = this.menuSelection(files);
+		if (!selection.length) return;
+		if (source !== VIEW_TYPE_PROGRESS) menu.addSeparator();
+		const actions = progressMenuActions(
+			selection,
+			selection.every((item) => this.isIncluded(item.path))
+		);
+		for (const action of actions) {
+			const details: Record<
+				ProgressMenuAction,
+				{ title: string; icon: string; run: () => void }
+			> = {
+				settings: {
+					title: "Progress settings…",
+					icon: "gauge",
+					run: () => new BulkProgressModal(this, selection).open(),
+				},
+				show: {
+					title: selection.length === 1 ? "Show progress bar" : "Show progress bars",
+					icon: "eye",
+					run: () => void this.applyProgressPatch(selection, { ...UNCHANGED_PATCH, scope: "show" }),
+				},
+				hide: {
+					title: selection.length === 1 ? "Hide progress bar" : "Hide progress bars",
+					icon: "eye-off",
+					run: () => void this.applyProgressPatch(selection, { ...UNCHANGED_PATCH, scope: "hide" }),
+				},
+				manual: {
+					title: "Set manual progress…",
+					icon: "percent",
+					run: () => new BulkProgressModal(this, selection, "manual").open(),
+				},
+				target: {
+					title: "Set progress target…",
+					icon: "target",
+					run: () => new BulkProgressModal(this, selection, "target").open(),
+				},
+				palette: {
+					title: "Set color palette…",
+					icon: "palette",
+					run: () => new BulkProgressModal(this, selection, "palette").open(),
+				},
+				clear: {
+					title: "Clear progress overrides…",
+					icon: "eraser",
+					run: () => new ClearProgressOverridesModal(this, selection).open(),
+				},
+			};
+			const detail = details[action];
+			menu.addItem((item) =>
+				item.setTitle(detail.title).setIcon(detail.icon).onClick(detail.run)
+			);
+		}
+	}
+
+	async applyProgressPatch(selection: ProgressSelectionItem[], patch: BulkProgressPatch) {
+		const touchesFiles = selection.some((item) => item.kind === "file");
+		const touchesFrontmatter =
+			touchesFiles &&
+			(patch.scope === "clear" ||
+				patch.manual.mode !== "unchanged" ||
+				patch.target.mode !== "unchanged" ||
+				patch.palette.mode !== "unchanged");
+		if (touchesFrontmatter) {
+			const conflict = this.frontmatterPropertyConflict();
+			if (conflict) {
+				new Notice(`Files Progress: ${conflict} Give each frontmatter setting a unique property.`);
+				return;
+			}
+			const missing = [
+				patch.manual.mode !== "unchanged" && !this.settings.manualProgressProperty.trim()
+					? "manual progress"
+					: "",
+				patch.target.mode !== "unchanged" && !this.settings.targetProperty.trim()
+					? "target"
+					: "",
+				patch.palette.mode !== "unchanged" && !this.settings.paletteProperty.trim()
+					? "palette"
+					: "",
+			].filter(Boolean);
+			if (missing.length) {
+				new Notice(`Configure the ${missing.join(", ")} frontmatter property before applying this change.`);
+				return;
+			}
+		}
+
+		try {
+			const result = await applyBulkProgressPatch(
+				{
+					settings: this.settings,
+					writeFrontmatter: async (path, update) => {
+						const file = this.app.vault.getAbstractFileByPath(path);
+						if (!(file instanceof TFile) || file.extension !== "md") {
+							throw new Error("Note no longer exists");
+						}
+						await this.app.fileManager.processFrontMatter(file, update);
+					},
+					saveSettings: () => this.saveSettings(),
+				},
+				selection,
+				patch
+			);
+			this.settingsChanged();
+			if (result.failedFiles.length) {
+				new Notice(
+					`Files Progress updated ${result.updatedFiles} note${
+						result.updatedFiles === 1 ? "" : "s"
+					}; ${result.failedFiles.length} failed.`
+				);
+			}
+		} catch (error) {
+			new Notice(error instanceof Error ? error.message : "Files Progress could not apply the changes.");
+		}
 	}
 
 	// ---------- scope ----------
@@ -489,13 +601,13 @@ export default class FilesProgressPlugin extends Plugin {
 	async activateView() {
 		const existing = this.app.workspace.getLeavesOfType(VIEW_TYPE_PROGRESS);
 		if (existing.length) {
-			await this.app.workspace.revealLeaf(existing[0]);
+			this.app.workspace.revealLeaf(existing[0]);
 			return;
 		}
 		const leaf = this.app.workspace.getRightLeaf(false);
 		if (!leaf) return;
 		await leaf.setViewState({ type: VIEW_TYPE_PROGRESS, active: true });
-		await this.app.workspace.revealLeaf(leaf);
+		this.app.workspace.revealLeaf(leaf);
 	}
 
 	notifyView() {
@@ -675,6 +787,233 @@ function editableFrontmatterText(value: unknown): string {
 	return typeof value === "string" || typeof value === "number" ? String(value) : "";
 }
 
+type BulkModalFocus = "manual" | "target" | "palette";
+type BulkValueMode = "unchanged" | "set" | "clear";
+
+export class BulkProgressModal extends Modal {
+	private scopeMode: BulkProgressPatch["scope"] = "unchanged";
+	private manualMode: BulkValueMode;
+	private targetMode: BulkValueMode;
+	private paletteMode: BulkValueMode;
+	private manualText = "";
+	private targetText = "";
+	private paletteValue: string;
+
+	constructor(
+		private plugin: FilesProgressPlugin,
+		private items: ProgressSelectionItem[],
+		private focus?: BulkModalFocus
+	) {
+		super(plugin.app);
+		this.manualMode = focus === "manual" ? "set" : "unchanged";
+		this.targetMode = focus === "target" ? "set" : "unchanged";
+		this.paletteMode = focus === "palette" ? "set" : "unchanged";
+		this.paletteValue = plugin.defaultPalette().name;
+	}
+
+	onOpen() {
+		const files = this.items.filter((item) => item.kind === "file").length;
+		const folders = this.items.length - files;
+		const summary = [
+			files ? `${files} note${files === 1 ? "" : "s"}` : "",
+			folders ? `${folders} folder${folders === 1 ? "" : "s"}` : "",
+		]
+			.filter(Boolean)
+			.join(" and ");
+		this.setTitle(this.focus ? this.focusTitle() : `Progress settings — ${summary}`);
+
+		if (!this.focus) this.renderScope();
+		if (files && (!this.focus || this.focus === "manual")) this.renderManual(files);
+		if (!this.focus || this.focus === "target") this.renderTarget();
+		if (!this.focus || this.focus === "palette") this.renderPalette();
+
+		new Setting(this.contentEl).addButton((button) =>
+			button
+				.setButtonText("Apply")
+				.setCta()
+				.onClick(() => void this.apply())
+		);
+	}
+
+	private focusTitle(): string {
+		if (this.focus === "manual") return "Set manual progress";
+		if (this.focus === "target") return "Set progress target";
+		return "Set color palette";
+	}
+
+	private addModeOptions(dropdown: { addOption(value: string, display: string): unknown }) {
+		dropdown.addOption("unchanged", "No change");
+		dropdown.addOption("set", "Set");
+		dropdown.addOption("clear", "Clear / inherit");
+	}
+
+	private renderScope() {
+		new Setting(this.contentEl)
+			.setName("Progress visibility")
+			.setDesc("Show or hide the selected items explicitly, or clear their exact scope override.")
+			.addDropdown((dropdown) =>
+				dropdown
+					.addOption("unchanged", "No change")
+					.addOption("show", "Show")
+					.addOption("hide", "Hide")
+					.addOption("clear", "Clear override")
+					.setValue(this.scopeMode)
+					.onChange((value) => (this.scopeMode = value as BulkProgressPatch["scope"]))
+			);
+	}
+
+	private renderManual(fileCount: number) {
+		let inputEl: HTMLInputElement;
+		const setting = new Setting(this.contentEl)
+			.setName("Manual progress")
+			.setDesc(
+				`Applies only to the ${fileCount} explicitly selected note${
+					fileCount === 1 ? "" : "s"
+				}; folders are never expanded.`
+			)
+			.addDropdown((dropdown) => {
+				this.addModeOptions(dropdown);
+				dropdown.setValue(this.manualMode).onChange((value) => {
+					this.manualMode = value as BulkValueMode;
+					inputEl.disabled = this.manualMode !== "set";
+				});
+			})
+			.addText((text) => {
+				inputEl = text.inputEl;
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.max = "100";
+				text.inputEl.step = "any";
+				text.setPlaceholder("1–100").onChange((value) => (this.manualText = value));
+				text.inputEl.disabled = this.manualMode !== "set";
+			});
+		return setting;
+	}
+
+	private renderTarget() {
+		let inputEl: HTMLInputElement;
+		new Setting(this.contentEl)
+			.setName("Target character count")
+			.setDesc("Notes receive frontmatter; folders receive an exact folder rule.")
+			.addDropdown((dropdown) => {
+				this.addModeOptions(dropdown);
+				dropdown.setValue(this.targetMode).onChange((value) => {
+					this.targetMode = value as BulkValueMode;
+					inputEl.disabled = this.targetMode !== "set";
+				});
+			})
+			.addText((text) => {
+				inputEl = text.inputEl;
+				text.inputEl.type = "number";
+				text.inputEl.min = "1";
+				text.inputEl.step = "1";
+				text.setPlaceholder("Characters").onChange((value) => (this.targetText = value));
+				text.inputEl.disabled = this.targetMode !== "set";
+			});
+	}
+
+	private renderPalette() {
+		let paletteEl: HTMLSelectElement;
+		new Setting(this.contentEl)
+			.setName("Color palette")
+			.setDesc("Notes receive frontmatter; folders receive an exact folder rule.")
+			.addDropdown((dropdown) => {
+				this.addModeOptions(dropdown);
+				dropdown.setValue(this.paletteMode).onChange((value) => {
+					this.paletteMode = value as BulkValueMode;
+					paletteEl.disabled = this.paletteMode !== "set";
+				});
+			})
+			.addDropdown((dropdown) => {
+				paletteEl = dropdown.selectEl;
+				for (const palette of this.plugin.settings.palettes) {
+					dropdown.addOption(palette.name, palette.name);
+				}
+				dropdown
+					.setValue(this.paletteValue)
+					.onChange((value) => (this.paletteValue = value));
+				dropdown.selectEl.disabled = this.paletteMode !== "set";
+			});
+	}
+
+	private async apply() {
+		const manual =
+			this.manualMode === "set" ? parseManualProgress(this.manualText) : undefined;
+		if (this.manualMode === "set" && manual === undefined) {
+			new Notice("Manual progress must be a number from 1 through 100.");
+			return;
+		}
+		const targetNumber = Number(this.targetText);
+		const target = Math.round(targetNumber);
+		if (
+			this.targetMode === "set" &&
+			(!this.targetText.trim() || !Number.isFinite(targetNumber) || target <= 0)
+		) {
+			new Notice("Target character count must be a positive number.");
+			return;
+		}
+		const patch: BulkProgressPatch = {
+			scope: this.scopeMode,
+			manual:
+				this.manualMode === "set"
+					? { mode: "set", value: manual! }
+					: { mode: this.manualMode },
+			target:
+				this.targetMode === "set"
+					? { mode: "set", value: target }
+					: { mode: this.targetMode },
+			palette:
+				this.paletteMode === "set"
+					? { mode: "set", value: this.paletteValue }
+					: { mode: this.paletteMode },
+		};
+		await this.plugin.applyProgressPatch(this.items, patch);
+		this.close();
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
+export class ClearProgressOverridesModal extends Modal {
+	constructor(
+		private plugin: FilesProgressPlugin,
+		private items: ProgressSelectionItem[]
+	) {
+		super(plugin.app);
+	}
+
+	onOpen() {
+		this.setTitle("Clear progress overrides?");
+		this.contentEl.createEl("p", {
+			text: `Clear Files Progress scope, manual progress, target, and palette overrides for ${this.items.length} selected item${
+				this.items.length === 1 ? "" : "s"
+			}? Folder descendants will not be rewritten.`,
+		});
+		new Setting(this.contentEl)
+			.addButton((button) => button.setButtonText("Cancel").onClick(() => this.close()))
+			.addButton((button) =>
+				button
+					.setButtonText("Clear overrides")
+					.setWarning()
+					.onClick(async () => {
+						await this.plugin.applyProgressPatch(this.items, {
+							scope: "clear",
+							manual: { mode: "clear" },
+							target: { mode: "clear" },
+							palette: { mode: "clear" },
+						});
+						this.close();
+					})
+			);
+	}
+
+	onClose() {
+		this.contentEl.empty();
+	}
+}
+
 /** Modal opened from a note context menu: frontmatter-backed note overrides. */
 export class FileProgressModal extends Modal {
 	constructor(private plugin: FilesProgressPlugin, private file: TFile) {
@@ -761,7 +1100,7 @@ export class FileProgressModal extends Modal {
 			buttons.addButton((button) =>
 				button
 					.setButtonText("Clear overrides")
-					.setDestructive()
+					.setWarning()
 					.onClick(() => void this.clearOverrides())
 			);
 		}
@@ -917,7 +1256,7 @@ export class FolderRuleModal extends Modal {
 			buttons.addButton((button) =>
 				button
 					.setButtonText("Remove override")
-					.setDestructive()
+					.setWarning()
 					.onClick(async () => {
 						this.plugin.settings.folderRules = this.plugin.settings.folderRules.filter(
 							(r) => r.path !== this.folderPath

@@ -1,5 +1,6 @@
 import { ItemView, Keymap, Menu, TFile, TFolder, WorkspaceLeaf, setIcon } from "obsidian";
 import type FilesProgressPlugin from "./main";
+import { PathSelection } from "./selection";
 import {
 	ViewSort,
 	formatManualPercent,
@@ -105,6 +106,8 @@ export class ProgressView extends ItemView {
 	private useRegex = false;
 	private collapsedGroups = new Set<string>();
 	private renderTimer: number | null = null;
+	private selection = new PathSelection();
+	private visiblePaths: string[] = [];
 	private statsEl!: HTMLElement;
 	private listEl!: HTMLElement;
 
@@ -276,6 +279,8 @@ export class ProgressView extends ItemView {
 		);
 
 		if (!rows.length) {
+			this.visiblePaths = [];
+			this.selection.prune([]);
 			this.listEl.createDiv({
 				cls: "ofp-empty",
 				text: this.query.trim() ? "No notes match the filter." : "No notes in scope yet.",
@@ -289,13 +294,25 @@ export class ProgressView extends ItemView {
 				const key = parentPath(row.file.path) || "/";
 				(groups.get(key) ?? groups.set(key, []).get(key)!).push(row);
 			}
-			for (const key of Array.from(groups.keys()).sort((a, b) => a.localeCompare(b))) {
+			const keys = Array.from(groups.keys()).sort((a, b) => a.localeCompare(b));
+			this.visiblePaths = [];
+			for (const key of keys) {
 				const groupRows = groups.get(key)!;
 				this.sortRows(groupRows);
+				if (key !== "/") this.visiblePaths.push(key);
+				if (!this.collapsedGroups.has(key)) {
+					this.visiblePaths.push(...groupRows.map((row) => row.file.path));
+				}
+			}
+			this.selection.prune(this.visiblePaths);
+			for (const key of keys) {
+				const groupRows = groups.get(key)!;
 				this.renderGroup(key, groupRows);
 			}
 		} else {
 			this.sortRows(rows);
+			this.visiblePaths = rows.map((row) => row.file.path);
+			this.selection.prune(this.visiblePaths);
 			for (const row of rows) this.renderRow(this.listEl, row, true);
 		}
 	}
@@ -304,6 +321,7 @@ export class ProgressView extends ItemView {
 		const collapsed = this.collapsedGroups.has(key);
 		const header = this.listEl.createDiv({ cls: "ofp-group-header" });
 		header.toggleClass("is-collapsed", collapsed);
+		if (key !== "/") this.setSelectionAttributes(header, key);
 
 		const chevron = header.createSpan({ cls: "ofp-group-chevron" });
 		setIcon(chevron, "chevron-down");
@@ -318,11 +336,14 @@ export class ProgressView extends ItemView {
 		if (collapsed) body.hide();
 		for (const row of rows) this.renderRow(body, row, false);
 
-		header.onclick = () => {
+		header.onclick = (event) => {
+			if (key !== "/" && (event.shiftKey || event.ctrlKey || event.metaKey)) {
+				this.handleSelectionClick(key, event);
+				return;
+			}
 			if (this.collapsedGroups.has(key)) this.collapsedGroups.delete(key);
 			else this.collapsedGroups.add(key);
-			header.toggleClass("is-collapsed", this.collapsedGroups.has(key));
-			body.toggle(this.collapsedGroups.has(key) === false);
+			this.renderList();
 		};
 		if (key !== "/") {
 			header.addEventListener("contextmenu", (event) => {
@@ -330,6 +351,8 @@ export class ProgressView extends ItemView {
 				if (!(folder instanceof TFolder)) return;
 				event.preventDefault();
 				event.stopPropagation();
+				this.selection.selectForContextMenu(key);
+				this.updateSelectionStyles();
 				this.showFileMenu(folder, event);
 			});
 		}
@@ -341,6 +364,7 @@ export class ProgressView extends ItemView {
 				? formatManualPercent(row.manualPercent)
 				: String(Math.round(row.ratio * 100));
 		const rowEl = container.createDiv({ cls: "ofp-row" });
+		this.setSelectionAttributes(rowEl, row.file.path);
 		rowEl.setAttr(
 			"aria-label",
 			row.manualPercent !== undefined
@@ -360,6 +384,8 @@ export class ProgressView extends ItemView {
 		menuButton.addEventListener("click", (event) => {
 			event.preventDefault();
 			event.stopPropagation();
+			this.selection.selectForContextMenu(row.file.path);
+			this.updateSelectionStyles();
 			const rect = menuButton.getBoundingClientRect();
 			this.showFileMenuAt(row.file, rect.right, rect.bottom, menuButton.doc);
 		});
@@ -383,17 +409,57 @@ export class ProgressView extends ItemView {
 		);
 
 		rowEl.addEventListener("click", (evt) => {
+			if (evt.shiftKey || evt.ctrlKey || evt.metaKey) {
+				this.handleSelectionClick(row.file.path, evt);
+				return;
+			}
+			this.selection.replace(row.file.path);
+			this.updateSelectionStyles();
 			void this.plugin.app.workspace.getLeaf(Keymap.isModEvent(evt)).openFile(row.file);
 		});
 		rowEl.addEventListener("contextmenu", (event) => {
 			event.preventDefault();
 			event.stopPropagation();
+			this.selection.selectForContextMenu(row.file.path);
+			this.updateSelectionStyles();
 			this.showFileMenu(row.file, event);
 		});
 	}
 
-	private createFileMenu(file: TFile | TFolder): Menu {
+	private handleSelectionClick(path: string, event: MouseEvent) {
+		if (event.shiftKey) this.selection.selectRange(path, this.visiblePaths);
+		else this.selection.toggle(path);
+		this.updateSelectionStyles();
+	}
+
+	private setSelectionAttributes(el: HTMLElement, path: string) {
+		el.dataset.ofpPath = path;
+		el.setAttr("role", "option");
+		const selected = this.selection.has(path);
+		el.toggleClass("is-selected", selected);
+		el.setAttr("aria-selected", selected ? "true" : "false");
+	}
+
+	private updateSelectionStyles() {
+		for (const el of Array.from(this.listEl.querySelectorAll<HTMLElement>("[data-ofp-path]"))) {
+			const selected = this.selection.has(el.dataset.ofpPath ?? "");
+			el.toggleClass("is-selected", selected);
+			el.setAttr("aria-selected", selected ? "true" : "false");
+		}
+	}
+
+	private selectedFiles(anchor: TFile | TFolder): (TFile | TFolder)[] {
+		if (!this.selection.has(anchor.path)) this.selection.replace(anchor.path);
+		const ordered = this.visiblePaths.filter((path) => this.selection.has(path));
+		const files = ordered
+			.map((path) => this.plugin.app.vault.getAbstractFileByPath(path))
+			.filter((file): file is TFile | TFolder => file instanceof TFile || file instanceof TFolder);
+		return files.length ? files : [anchor];
+	}
+
+	private createFileMenu(files: (TFile | TFolder)[]): Menu {
 		const menu = new Menu();
+		const file = files.length === 1 ? files[0] : undefined;
 		if (file instanceof TFile) {
 			menu.addItem((item) =>
 				item
@@ -409,15 +475,19 @@ export class ProgressView extends ItemView {
 			);
 			menu.addSeparator();
 		}
-		this.plugin.app.workspace.trigger("file-menu", menu, file, VIEW_TYPE_PROGRESS, this.leaf);
+		if (files.length === 1) {
+			this.plugin.app.workspace.trigger("file-menu", menu, files[0], VIEW_TYPE_PROGRESS, this.leaf);
+		} else {
+			this.plugin.app.workspace.trigger("files-menu", menu, files, VIEW_TYPE_PROGRESS, this.leaf);
+		}
 		return menu;
 	}
 
 	private showFileMenu(file: TFile | TFolder, event: MouseEvent) {
-		this.createFileMenu(file).showAtMouseEvent(event);
+		this.createFileMenu(this.selectedFiles(file)).showAtMouseEvent(event);
 	}
 
 	private showFileMenuAt(file: TFile, x: number, y: number, doc: Document) {
-		this.createFileMenu(file).showAtPosition({ x, y }, doc);
+		this.createFileMenu(this.selectedFiles(file)).showAtPosition({ x, y }, doc);
 	}
 }
