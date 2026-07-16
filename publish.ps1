@@ -124,9 +124,9 @@ if ($LASTEXITCODE -eq 0) {
     throw "GitHub release '$version' already exists. Bump the version before publishing."
 }
 
-# --- 1. Local build preflight -----------------------------------------------
-npm run build
-Assert-LastExitCode "Local build failed; no commits or tags were pushed."
+# --- 1. Local verification preflight ----------------------------------------
+npm run check
+Assert-LastExitCode "Local lint, tests, or build failed; no commits or tags were pushed."
 
 $postBuildChanges = @(git status --short --untracked-files=all)
 Assert-LastExitCode "Could not inspect the Git working tree after the build."
@@ -183,10 +183,47 @@ foreach ($asset in @("main.js", "manifest.json", "styles.css")) {
     }
 }
 
+$downloadDir = Join-Path ([IO.Path]::GetTempPath()) "files-progress-release-$version-$([guid]::NewGuid().ToString('N'))"
+New-Item -ItemType Directory -Path $downloadDir | Out-Null
+try {
+    gh release download $version --repo $repoSlug --dir $downloadDir --pattern "main.js" --pattern "manifest.json" --pattern "styles.css"
+    Assert-LastExitCode "Could not download release assets for verification."
+    $releasedManifest = Get-Content (Join-Path $downloadDir "manifest.json") -Raw | ConvertFrom-Json
+    if ([string] $releasedManifest.version -ne $version -or
+        [string] $releasedManifest.minAppVersion -ne [string] $manifest.minAppVersion) {
+        throw "The released manifest metadata does not match the tagged source."
+    }
+    foreach ($asset in @("main.js", "manifest.json", "styles.css")) {
+        $localHash = (Get-FileHash -LiteralPath (Join-Path $PluginDir $asset) -Algorithm SHA256).Hash
+        $releaseHash = (Get-FileHash -LiteralPath (Join-Path $downloadDir $asset) -Algorithm SHA256).Hash
+        if ($localHash -ne $releaseHash) {
+            throw "Released asset '$asset' does not match the locally verified build."
+        }
+    }
+} finally {
+    $resolvedTemp = (Resolve-Path -LiteralPath $downloadDir -ErrorAction SilentlyContinue).Path
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    if ($resolvedTemp -and $resolvedTemp.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        Remove-Item -Recurse -Force -LiteralPath $resolvedTemp
+    }
+}
+
+$communityStatus = "not listed"
+try {
+    $communityPlugins = Invoke-RestMethod "https://raw.githubusercontent.com/obsidianmd/obsidian-releases/master/community-plugins.json"
+    if ($communityPlugins | Where-Object { $_.repo -eq $repoSlug -or $_.id -eq $manifest.id }) {
+        $communityStatus = "listed"
+    }
+} catch {
+    $communityStatus = "could not be checked"
+}
+
 Write-Host "Release $version published with GitHub build-provenance attestations." -ForegroundColor Green
 Write-Host "  Release:      $($release.url)"
 Write-Host "  Attestations: $($repo.url)/attestations"
 Write-Host "  Verify:       gh attestation verify <downloaded-asset> --repo $repoSlug"
+Write-Host "  Community:    $communityStatus"
 Write-Host ""
-Write-Host "For the one-time Obsidian directory submission, visit https://community.obsidian.md" -ForegroundColor Cyan
-Write-Host "Until approval, users can install via BRAT with: $repoSlug"
+Write-Host "A GitHub release enables BRAT; it does not publish the plugin to the Obsidian community directory." -ForegroundColor Cyan
+Write-Host "One-time directory submission: https://community.obsidian.md/plugins"
+Write-Host "BRAT repository: $repoSlug"
